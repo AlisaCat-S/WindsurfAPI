@@ -26,9 +26,13 @@ function json(res, status, body) {
 }
 
 function checkAuth(req) {
-  if (!config.dashboardPassword) return true;
   const pw = req.headers['x-dashboard-password'] || '';
-  return pw === config.dashboardPassword;
+  // If dashboard password is set, use it
+  if (config.dashboardPassword) return pw === config.dashboardPassword;
+  // Otherwise fall back to API key (if set)
+  if (config.apiKey) return pw === config.apiKey;
+  // No password and no API key = open access
+  return true;
 }
 
 /**
@@ -44,7 +48,8 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
   // ─── Auth ─────────────────────────────────────────────
   if (subpath === '/auth') {
-    if (!config.dashboardPassword) return json(res, 200, { required: false });
+    const needsAuth = !!(config.dashboardPassword || config.apiKey);
+    if (!needsAuth) return json(res, 200, { required: false });
     return json(res, 200, { required: true, valid: checkAuth(req) });
   }
 
