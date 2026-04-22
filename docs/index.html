@@ -184,12 +184,17 @@ nav .nav-cta:hover{background:var(--coral-deep);color:#fff}
 @media(max-width:860px){.arch-conn-line{top:0;bottom:0;left:50%;width:2px;height:100%;background:linear-gradient(180deg,rgba(204,120,92,.08),rgba(204,120,92,.25),rgba(204,120,92,.08))}}
 .arch-conn-dot{position:absolute;width:6px;height:6px;border-radius:50%;background:#CC785C;box-shadow:0 0 8px 2px rgba(204,120,92,.4);animation:a-flow 2.5s ease-in-out infinite}
 @media(max-width:860px){.arch-conn-dot{animation-name:a-flow-v}}
-.arch-conn:nth-of-type(2) .arch-conn-dot{animation-delay:.6s}
-.arch-conn:nth-of-type(3) .arch-conn-dot{animation-delay:1.2s}
+.arch-conn:nth-of-type(2) .arch-conn-dot:not(.ret){animation-delay:.6s}
+.arch-conn:nth-of-type(3) .arch-conn-dot:not(.ret){animation-delay:1.2s}
+.arch-conn:nth-of-type(1) .arch-conn-dot.ret{animation-delay:1.5s}
+.arch-conn:nth-of-type(2) .arch-conn-dot.ret{animation-delay:.9s}
+.arch-conn:nth-of-type(3) .arch-conn-dot.ret{animation-delay:.3s}
 @keyframes a-flow{0%{left:0;opacity:0}10%{opacity:1}90%{opacity:1}100%{left:calc(100% - 6px);opacity:0}}
 @keyframes a-flow-v{0%{top:0;opacity:0}10%{opacity:1}90%{opacity:1}100%{top:calc(100% - 6px);opacity:0}}
-.arch-conn-proto{position:absolute;top:-18px;left:50%;transform:translateX(-50%);font-family:var(--mono);font-size:.65rem;color:#6B6556;letter-spacing:.06em;white-space:nowrap;background:rgba(21,18,16,.8);padding:0 .4rem}
-@media(max-width:860px){.arch-conn-proto{top:50%;left:calc(50% + 14px);transform:translateY(-50%) translateX(0)}}
+.arch-conn-proto{position:absolute;bottom:-20px;left:50%;transform:translateX(-50%);font-family:var(--mono);font-size:.65rem;color:#6B6556;letter-spacing:.06em;white-space:nowrap;background:rgba(21,18,16,.8);padding:.1rem .5rem;border-radius:3px}
+@media(max-width:860px){.arch-conn-proto{bottom:auto;top:50%;left:calc(50% + 14px);transform:translateY(-50%) translateX(0)}}
+.arch-conn-dot.ret{background:#8B6FB0;box-shadow:0 0 8px 2px rgba(139,111,176,.4);animation:a-flow-ret 3s ease-in-out infinite}
+@keyframes a-flow-ret{0%{left:calc(100% - 6px);opacity:0}10%{opacity:1}90%{opacity:1}100%{left:0;opacity:0}}
 .arch-features{display:grid;grid-template-columns:repeat(3,1fr);gap:.5rem;margin-top:2.5rem;max-width:680px;margin-left:auto;margin-right:auto}
 @media(max-width:600px){.arch-features{grid-template-columns:repeat(2,1fr)}}
 .arch-ft{display:flex;align-items:center;gap:.5rem;padding:.6rem .8rem;border-radius:10px;border:1px solid rgba(232,226,212,.07);background:rgba(30,27,23,.5);transition:all .25s;cursor:default}
@@ -463,6 +468,7 @@ footer{border-top:1px solid var(--rule);padding:3rem 0 2.5rem;margin-top:2rem}
         <div class="arch-conn">
           <div class="arch-conn-line"></div>
           <div class="arch-conn-dot"></div>
+          <div class="arch-conn-dot ret"></div>
           <div class="arch-conn-proto">HTTP · SSE</div>
         </div>
 
@@ -483,6 +489,7 @@ footer{border-top:1px solid var(--rule);padding:3rem 0 2.5rem;margin-top:2rem}
         <div class="arch-conn">
           <div class="arch-conn-line"></div>
           <div class="arch-conn-dot"></div>
+          <div class="arch-conn-dot ret"></div>
           <div class="arch-conn-proto">Protobuf · gRPC</div>
         </div>
 
@@ -502,6 +509,7 @@ footer{border-top:1px solid var(--rule);padding:3rem 0 2.5rem;margin-top:2rem}
         <div class="arch-conn">
           <div class="arch-conn-line"></div>
           <div class="arch-conn-dot"></div>
+          <div class="arch-conn-dot ret"></div>
           <div class="arch-conn-proto">TLS · HTTPS</div>
         </div>
 
