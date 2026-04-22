@@ -183,11 +183,15 @@ export async function handleChatCompletions(body) {
   // ── Model identity prompt injection ──
   // When enabled, prepend a system message so the model identifies itself as
   // the requested model (e.g. "I am Claude Opus 4.6") instead of leaking the
-  // Cascade/Windsurf backend identity. Inject into BOTH messages (for legacy
-  // RawGetChatMessage path) and cascadeMessages (Cascade path) — they diverge
-  // once tool-emulation rewrites the Cascade path, but the system identity
-  // should be identical in both.
-  if (isExperimentalEnabled('modelIdentityPrompt') && modelInfo?.provider) {
+  // Cascade/Windsurf backend identity.
+  //
+  // SKIP when the client already sends a system message (Claude Code, Cline,
+  // Cursor all inject their own system prompt). Adding our identity on top of
+  // the client's system prompt AND Cascade's baked-in "I am Cascade" creates
+  // a triple-identity conflict that newer reasoning models (opus-4-7) detect
+  // and refuse as prompt injection. (#22)
+  const clientHasSystem = Array.isArray(messages) && messages.some(m => m?.role === 'system');
+  if (isExperimentalEnabled('modelIdentityPrompt') && modelInfo?.provider && !clientHasSystem) {
     const identityText = buildIdentitySystemMessage(displayModel, modelInfo.provider);
     if (identityText) {
       const sysMsg = { role: 'system', content: identityText };
