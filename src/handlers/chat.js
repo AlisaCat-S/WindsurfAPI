@@ -22,7 +22,7 @@ import {
   normalizeMessagesForCascade, ToolCallStreamParser, parseToolCallsFromText,
   buildToolPreambleForProto,
 } from './tool-emulation.js';
-import { sanitizeText, PathSanitizeStream } from '../sanitize.js';
+import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
 
 const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
@@ -748,9 +748,12 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             safeText = safe;
             // Only emit tool_call deltas when emulating — otherwise the
             // parsed calls came from Cascade's built-in tools and are
-            // silently discarded.
+            // silently discarded. Sanitize server-internal paths out of
+            // the emulated call's input too (issue #38) — otherwise Claude
+            // Code tries to Read the sandbox path and fails.
             if (emulateTools) {
-              for (const tc of done) {
+              for (const rawTc of done) {
+                const tc = sanitizeToolCall(rawTc);
                 const idx = collectedToolCalls.length;
                 collectedToolCalls.push(tc);
                 emitToolCallDelta(tc, idx);
@@ -861,7 +864,8 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               const tail = toolParser.flush();
               if (tail.text) emitContent(pathStreamText.feed(tail.text));
               if (emulateTools) {
-                for (const tc of tail.toolCalls) {
+                for (const rawTc of tail.toolCalls) {
+                  const tc = sanitizeToolCall(rawTc);
                   const idx = collectedToolCalls.length;
                   collectedToolCalls.push(tc);
                   emitToolCallDelta(tc, idx);

@@ -41,20 +41,45 @@ function sha256(s) {
   return createHash('sha256').update(s).digest('hex');
 }
 
+// Client-injected meta tags whose bodies change every turn (cwd snapshot,
+// todo state, current time, hook output, slash-command echo). If we hash
+// these, the fingerprint drifts even when the real user text is unchanged
+// and Cascade reuse silently falls back to fresh for every call
+// (issue #24 — Claude Code users reported persistent reuse=false despite
+// PR #36's stableTurns fix because this class of drift wasn't being
+// neutralised). Strip them before hashing.
+const META_TAG_NAMES = [
+  'system-reminder',
+  'command-message',
+  'command-name',
+  'command-args',
+  'local-command-stdout',
+  'local-command-stderr',
+  'user-prompt-submit-hook',
+];
+const META_TAG_RE = new RegExp(
+  `<(${META_TAG_NAMES.join('|')})[^>]*>[\\s\\S]*?</\\1>`,
+  'g'
+);
+
+function stripMetaTags(s) {
+  if (typeof s !== 'string' || !s) return s;
+  return s.replace(META_TAG_RE, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
 /**
  * Canonicalise a message list for hashing. Strips anything that could drift
- * between turns (id, name, tool metadata) and normalises content to a
- * string so array/string forms collide correctly.
+ * between turns (id, name, tool metadata, client meta-tags) and normalises
+ * content to a string so array/string forms collide correctly.
  */
 function canonicalise(messages) {
-  return messages.map(m => ({
-    role: m.role,
-    content: typeof m.content === 'string'
-      ? m.content
-      : Array.isArray(m.content)
-        ? m.content.map(p => (typeof p?.text === 'string' ? p.text : JSON.stringify(p))).join('')
-        : JSON.stringify(m.content ?? ''),
-  }));
+  return messages.map(m => {
+    let raw;
+    if (typeof m.content === 'string') raw = m.content;
+    else if (Array.isArray(m.content)) raw = m.content.map(p => (typeof p?.text === 'string' ? p.text : JSON.stringify(p))).join('');
+    else raw = JSON.stringify(m.content ?? '');
+    return { role: m.role, content: stripMetaTags(raw) };
+  });
 }
 
 /**

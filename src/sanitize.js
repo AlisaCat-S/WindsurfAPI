@@ -27,6 +27,12 @@
 // other two go to "[internal]" — no reason a caller should ever see them.
 const PATTERNS = [
   [/\/tmp\/windsurf-workspace(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
+  // Cascade's sandbox workspace (per-account wsId). The model sees this path
+  // in its context because we AddTrackedWorkspace on it, then helpfully
+  // suggests it in tool calls — Claude Code then runs Read/Glob against
+  // a path that doesn't exist on the user's machine (issue #38). Rewrite
+  // to "." so the tool call falls back to cwd, which IS the user's project.
+  [/\/home\/user\/projects\/workspace-[a-z0-9]+(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
   [/\/opt\/windsurf(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]'],
   [/\/root\/WindsurfAPI(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]'],
 ];
@@ -34,6 +40,7 @@ const PATTERNS = [
 // Bare literals (no path tail) used by the streaming cut-point finder.
 const SENSITIVE_LITERALS = [
   '/tmp/windsurf-workspace',
+  '/home/user/projects/workspace-',
   '/opt/windsurf',
   '/root/WindsurfAPI',
 ];
@@ -134,17 +141,27 @@ export class PathSanitizeStream {
 }
 
 /**
- * Sanitize a native Cascade tool call (built-in tools like edit_file /
- * view_file) before surfacing to the client. Scrubs argumentsJson and
- * result. Not used on the hot path today — handlers/chat.js drops all
- * native tool calls in non-emulation mode rather than risking leakage —
- * but kept here for opt-in use.
+ * Sanitize a tool call before surfacing to the client. Covers three carriers
+ * a leaked path can ride:
+ *   - argumentsJson  (OpenAI-emulated + legacy native)
+ *   - result         (native Cascade tool result)
+ *   - input          (Anthropic-format parsed input dict — the hot path
+ *                     used by Claude Code streaming, issue #38)
+ * Without the `input` scrub, the stream handler would emit a tool_use
+ * delta whose file_path still references /home/user/projects/workspace-x
+ * and Claude Code would try to Read a path that doesn't exist locally.
  */
 export function sanitizeToolCall(tc) {
   if (!tc) return tc;
-  return {
-    ...tc,
-    argumentsJson: sanitizeText(tc.argumentsJson || ''),
-    result: sanitizeText(tc.result || ''),
-  };
+  const out = { ...tc };
+  if (typeof tc.argumentsJson === 'string') out.argumentsJson = sanitizeText(tc.argumentsJson);
+  if (typeof tc.result === 'string') out.result = sanitizeText(tc.result);
+  if (tc.input && typeof tc.input === 'object' && !Array.isArray(tc.input)) {
+    const safe = {};
+    for (const [k, v] of Object.entries(tc.input)) {
+      safe[k] = typeof v === 'string' ? sanitizeText(v) : v;
+    }
+    out.input = safe;
+  }
+  return out;
 }
