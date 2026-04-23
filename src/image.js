@@ -1,5 +1,6 @@
 import https from 'node:https';
 import http from 'node:http';
+import { lookup as dnsLookup } from 'node:dns';
 import { log } from './config.js';
 
 const MAX_SIZE = 5 * 1024 * 1024; // 5 MB
@@ -7,6 +8,26 @@ const MAX_BASE64_LEN = Math.ceil(MAX_SIZE * 4 / 3) + 100;
 const MAX_REDIRECTS = 3;
 const MIME_OK = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
 const PRIVATE_HOST = /^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|0\.|::1$|localhost$|0\.0\.0\.0$|\[::)/i;
+// Private/internal IP ranges (resolved address form). Matched after DNS
+// lookup so a public-looking hostname that resolves to an internal IP
+// (DNS rebinding / misconfigured wildcards) still gets blocked.
+const PRIVATE_IP = /^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.|0\.|::1$|::$|f[cd][0-9a-f]{2}:|fe80:)/i;
+
+// http/https `lookup` hook: runs in place of the default DNS resolution.
+// Rejecting here means the request never opens a socket to the internal
+// address, closing the DNS-rebinding gap in the string-based host check.
+function safeLookup(hostname, options, callback) {
+  dnsLookup(hostname, options, (err, address, family) => {
+    if (err) return callback(err);
+    const addrs = Array.isArray(address) ? address : [{ address, family }];
+    for (const a of addrs) {
+      if (PRIVATE_IP.test(a.address)) {
+        return callback(new Error(`Image URL resolves to private address: ${a.address}`));
+      }
+    }
+    callback(null, address, family);
+  });
+}
 
 function validateImageUrl(url) {
   let parsed;
@@ -35,7 +56,7 @@ export function fetchImageUrl(url, timeoutMs = 8000, _depth = 0) {
     const done = (fn, val) => { if (!settled) { settled = true; fn(val); } };
 
     const mod = url.startsWith('https') ? https : http;
-    const req = mod.get(url, { timeout: timeoutMs, headers: { 'Accept': 'image/*' } }, (res) => {
+    const req = mod.get(url, { timeout: timeoutMs, headers: { 'Accept': 'image/*' }, lookup: safeLookup }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         res.resume();
         return fetchImageUrl(res.headers.location, timeoutMs, _depth + 1).then(
