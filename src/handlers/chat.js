@@ -5,7 +5,7 @@
 
 import { randomUUID } from 'crypto';
 import { WindsurfClient } from '../client.js';
-import { getApiKey, acquireAccountByKey, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited } from '../auth.js';
+import { getApiKey, acquireAccountByKey, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited } from '../auth.js';
 import { resolveModel, getModelInfo } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
@@ -27,6 +27,11 @@ import { sanitizeText, PathSanitizeStream } from '../sanitize.js';
 const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
+const CASCADE_REUSE_STRICT = process.env.CASCADE_REUSE_STRICT === '1';
+const CASCADE_REUSE_STRICT_RETRY_MS = (() => {
+  const n = parseInt(process.env.CASCADE_REUSE_STRICT_RETRY_MS || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 60_000;
+})();
 
 // ── Model identity prompt ──────────────────────────────────
 // Templates live in runtime-config (editable from the dashboard). Use {model}
@@ -36,6 +41,19 @@ function buildIdentitySystemMessage(displayModel, provider) {
   const template = getIdentityPromptFor(provider);
   if (!template) return null;
   return template.replace(/\{model\}/g, displayModel);
+}
+
+function strictReuseRetryMs(availability) {
+  return Math.max(1000, availability?.retryAfterMs || CASCADE_REUSE_STRICT_RETRY_MS);
+}
+
+function strictReuseMessage(model, retryMs, reason = 'temporarily unavailable') {
+  return `${model} 上下文复用绑定账号暂不可用（${reason}）。为避免切换账号导致上下文丢失，请 ${Math.ceil(retryMs / 1000)} 秒后重试`;
+}
+
+function rateLimitCooldownMs(message = '') {
+  if (/about an hour|in an hour|try again in.*hour/i.test(message)) return 60 * 60 * 1000;
+  return 5 * 60 * 1000;
 }
 
 function genId() {
@@ -287,6 +305,22 @@ export async function handleChatCompletions(body) {
         }
         if (!acct) {
           log.info(`Chat[${reqId}]: reuse MISS — owning account not available after 5s wait`);
+          if (CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore) {
+            const availability = getAccountAvailability(checkedOutReuseEntry.apiKey, modelKey);
+            const retryAfterMs = strictReuseRetryMs(availability);
+            poolCheckin(fpBefore, checkedOutReuseEntry);
+            log.info(`Chat[${reqId}]: strict reuse preserved cascade; owner unavailable reason=${availability.reason}`);
+            return {
+              status: 429,
+              body: {
+                error: {
+                  message: strictReuseMessage(displayModel, retryAfterMs, availability.reason),
+                  type: 'rate_limit_exceeded',
+                  retry_after_ms: retryAfterMs,
+                },
+              },
+            };
+          }
           reuseEntry = null;
         }
       }
@@ -306,6 +340,22 @@ export async function handleChatCompletions(body) {
         if (!rl.hasCapacity) {
           log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
           markRateLimited(acct.apiKey, 5 * 60 * 1000, modelKey);
+          if (CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
+            const availability = getAccountAvailability(acct.apiKey, modelKey);
+            const retryAfterMs = strictReuseRetryMs(availability);
+            poolCheckin(fpBefore, checkedOutReuseEntry);
+            log.info(`Chat[${reqId}]: strict reuse preserved cascade after preflight rate limit`);
+            return {
+              status: 429,
+              body: {
+                error: {
+                  message: strictReuseMessage(displayModel, retryAfterMs, availability.reason),
+                  type: 'rate_limit_exceeded',
+                  retry_after_ms: retryAfterMs,
+                },
+              },
+            };
+          }
           continue;
         }
       } catch (e) {
@@ -342,6 +392,22 @@ export async function handleChatCompletions(body) {
     const errType = result.body?.error?.type;
     // Rate limit: this account is done for this model, try the next one
     if (errType === 'rate_limit_exceeded') {
+      if (CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
+        const availability = getAccountAvailability(acct.apiKey, modelKey);
+        const retryAfterMs = strictReuseRetryMs(availability);
+        poolCheckin(fpBefore, checkedOutReuseEntry);
+        log.info(`Chat[${reqId}]: strict reuse preserved cascade after rate limit`);
+        return {
+          status: 429,
+          body: {
+            error: {
+              message: strictReuseMessage(displayModel, retryAfterMs, availability.reason),
+              type: 'rate_limit_exceeded',
+              retry_after_ms: retryAfterMs,
+            },
+          },
+        };
+      }
       log.warn(`Account ${acct.email} rate-limited on ${displayModel}, trying next account`);
       continue;
     }
@@ -486,7 +552,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
     const isInternal = /internal error occurred.*error id/i.test(err.message);
     if (isAuthFail) reportError(apiKey);
-    if (isRateLimit) { markRateLimited(apiKey, 5 * 60 * 1000, modelKey); err.isRateLimit = true; err.isModelError = true; }
+    if (isRateLimit) { markRateLimited(apiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; }
     if (isInternal) { reportInternalError(apiKey); err.isModelError = true; }
     if (err.isModelError && !isRateLimit && !isInternal) {
       updateCapability(apiKey, modelKey, false, 'model_error');
@@ -713,6 +779,13 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               }
               if (!acct) {
                 log.info(`Chat[${reqId}]: reuse MISS — owning account not available after 5s wait`);
+                if (CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore) {
+                  const availability = getAccountAvailability(checkedOutReuseEntry.apiKey, modelKey);
+                  const retryAfterMs = strictReuseRetryMs(availability);
+                  lastErr = new Error(strictReuseMessage(model, retryAfterMs, availability.reason));
+                  log.info(`Chat[${reqId}]: strict reuse preserved cascade; owner unavailable reason=${availability.reason}`);
+                  break;
+                }
                 reuseEntry = null;
               }
             }
@@ -732,6 +805,13 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               if (!rl.hasCapacity) {
                 log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
                 markRateLimited(acct.apiKey, 5 * 60 * 1000, modelKey);
+                if (CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
+                  const availability = getAccountAvailability(acct.apiKey, modelKey);
+                  const retryAfterMs = strictReuseRetryMs(availability);
+                  lastErr = new Error(strictReuseMessage(model, retryAfterMs, availability.reason));
+                  log.info(`Chat[${reqId}]: strict reuse preserved cascade after preflight rate limit`);
+                  break;
+                }
                 continue;
               }
             } catch (e) {
@@ -825,10 +905,14 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
             const isInternal = /internal error occurred.*error id/i.test(err.message);
             if (isAuthFail) reportError(currentApiKey);
-            if (isRateLimit) { markRateLimited(currentApiKey, 5 * 60 * 1000, modelKey); err.isRateLimit = true; err.isModelError = true; }
+            if (isRateLimit) { markRateLimited(currentApiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; }
             if (isInternal) { reportInternalError(currentApiKey); err.isModelError = true; }
             if (err.isModelError && !isRateLimit && !isInternal) {
               updateCapability(currentApiKey, modelKey, false, 'model_error');
+            }
+            if (isRateLimit && CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === currentApiKey) {
+              log.info(`Chat[${reqId}]: strict reuse preserved cascade after rate limit`);
+              break;
             }
             // Retry only if nothing has been streamed yet AND it's a retryable error
             if (!hadSuccess && (err.isModelError || isRateLimit)) {

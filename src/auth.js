@@ -429,6 +429,41 @@ export function acquireAccountByKey(apiKey, modelKey = null) {
 }
 
 /**
+ * Explain why a pinned account cannot be used right now. Used by strict
+ * Cascade reuse mode, where switching accounts would lose server-side
+ * conversation context.
+ */
+export function getAccountAvailability(apiKey, modelKey = null) {
+  const now = Date.now();
+  const a = accounts.find(x => x.apiKey === apiKey);
+  if (!a) return { available: false, reason: 'missing', retryAfterMs: 60_000 };
+  if (a.status !== 'active') return { available: false, reason: `status:${a.status}`, retryAfterMs: 60_000 };
+
+  if (a.rateLimitedUntil && a.rateLimitedUntil > now) {
+    return { available: false, reason: 'rate_limited', retryAfterMs: Math.max(1000, a.rateLimitedUntil - now) };
+  }
+  if (modelKey && a._modelRateLimits) {
+    const until = a._modelRateLimits[modelKey];
+    if (until && until > now) {
+      return { available: false, reason: 'model_rate_limited', retryAfterMs: Math.max(1000, until - now) };
+    }
+    if (until && until <= now) delete a._modelRateLimits[modelKey];
+  }
+
+  const limit = rpmLimitFor(a);
+  if (limit <= 0) return { available: false, reason: 'tier_expired', retryAfterMs: 60_000 };
+  const used = pruneRpmHistory(a, now);
+  if (used >= limit) {
+    const oldest = a._rpmHistory?.[0] || now;
+    return { available: false, reason: 'rpm_full', retryAfterMs: Math.max(1000, oldest + RPM_WINDOW_MS - now) };
+  }
+  if (modelKey && !isModelAllowedForAccount(a, modelKey)) {
+    return { available: false, reason: 'model_not_available', retryAfterMs: 60_000 };
+  }
+  return { available: true, reason: 'available', retryAfterMs: 0 };
+}
+
+/**
  * Snapshot of per-account RPM usage, for dashboard display.
  */
 export function getRpmStats() {

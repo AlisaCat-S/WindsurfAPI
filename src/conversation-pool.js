@@ -18,12 +18,18 @@
  *     the same LS and the same account or the cascade_id is meaningless.
  *   - A checked-out entry is removed from the pool. Concurrent second request
  *     with the same fingerprint falls back to a fresh cascade.
- *   - TTL 30 min; LRU eviction at 500 entries.
+ *   - TTL defaults to 30 min (override with CASCADE_POOL_TTL_MS); LRU eviction
+ *     at 500 entries.
  */
 
 import { createHash } from 'crypto';
 
-const POOL_TTL_MS = 30 * 60 * 1000;
+function positiveIntEnv(name, fallback) {
+  const n = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+const POOL_TTL_MS = positiveIntEnv('CASCADE_POOL_TTL_MS', 30 * 60 * 1000);
 const POOL_MAX = 500;
 
 // fingerprint -> { cascadeId, sessionId, lsPort, apiKey, createdAt, lastAccess }
