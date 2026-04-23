@@ -56,6 +56,10 @@ const META_TAG_NAMES = [
   'local-command-stdout',
   'local-command-stderr',
   'user-prompt-submit-hook',
+  // Captured from real Claude Code v2.1.118 traffic via META_TAG_AUDIT
+  'analysis',
+  'summary',
+  'example',
 ];
 const META_TAG_RE = new RegExp(
   `<(${META_TAG_NAMES.join('|')})[^>]*>[\\s\\S]*?</\\1>`,
