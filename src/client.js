@@ -8,6 +8,8 @@
 
 import https from 'https';
 import { randomUUID } from 'crypto';
+import { existsSync, mkdirSync, writeFileSync } from 'fs';
+import { execSync } from 'child_process';
 import { log } from './config.js';
 import { extractImages } from './image.js';
 import { grpcFrame, grpcUnary, grpcStream } from './grpc.js';
@@ -62,6 +64,41 @@ function cascadeHistoryBudget(modelUid) {
     return positiveIntEnv('CASCADE_1M_HISTORY_BYTES', 900_000);
   }
   return normal;
+}
+
+// ── Fake workspace scaffold ────────────────────────────────
+// A real Windsurf IDE always has a workspace directory that the LS scans
+// for git state, file tree, etc. The reverse proxy previously registered
+// a non-existent path (/home/user/projects/workspace-{hash}), so the LS
+// had zero workspace context — a detectable fingerprint gap. Creating a
+// real directory with a git repo and basic project structure closes this
+// gap. The scaffold is created once per account and persists.
+const _seededWorkspaces = new Set();
+
+function ensureWorkspaceDir(workspacePath) {
+  if (_seededWorkspaces.has(workspacePath)) return;
+  try {
+    if (!existsSync(workspacePath)) {
+      mkdirSync(workspacePath, { recursive: true });
+      // Seed a minimal project so the LS has something to index
+      writeFileSync(`${workspacePath}/package.json`, JSON.stringify({
+        name: 'workspace', version: '1.0.0', private: true,
+        description: 'Development workspace',
+      }, null, 2) + '\n');
+      writeFileSync(`${workspacePath}/README.md`, '# Workspace\n\nDevelopment workspace.\n');
+      writeFileSync(`${workspacePath}/.gitignore`, 'node_modules/\n.env\n');
+      // Init git repo so LS picks up real git state
+      try {
+        execSync('git init -q && git add -A && git commit -q -m "init" --allow-empty', {
+          cwd: workspacePath, stdio: 'ignore', timeout: 5000,
+        });
+      } catch {}
+      log.info(`Workspace scaffold created: ${workspacePath}`);
+    }
+    _seededWorkspaces.add(workspacePath);
+  } catch (e) {
+    log.debug(`ensureWorkspaceDir: ${e.message}`);
+  }
 }
 
 // ─── WindsurfClient ────────────────────────────────────────
@@ -179,6 +216,7 @@ export class WindsurfClient {
           `${LS_SERVICE}/InitializeCascadePanelState`, grpcFrame(initProto), 5000);
       } catch (e) { log.warn(`InitializeCascadePanelState: ${e.message}`); }
       try {
+        ensureWorkspaceDir(workspacePath);
         const addWsProto = buildAddTrackedWorkspaceRequest(this.apiKey, workspacePath, sessionId);
         await grpcUnary(this.port, this.csrfToken,
           `${LS_SERVICE}/AddTrackedWorkspace`, grpcFrame(addWsProto), 5000);

@@ -27,6 +27,40 @@ import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.
 const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
+
+// ── Language-following reinforcement ──────────────────────────
+// Claude Code injects ~100KB of English system prompt + tool definitions
+// into the conversation, which drowns out the communication_section
+// (proto field 13) language instruction. Detecting CJK characters in the
+// user's latest message and appending a brief reminder directly into the
+// message content ensures the model sees it at the point of highest
+// attention. Only modifies cascadeMessages (not the original messages
+// used for fingerprinting). (#35)
+const CJK_RE = /[\u4e00-\u9fff\u3400-\u4dbf]/;
+const JP_RE  = /[\u3040-\u309f\u30a0-\u30ff]/;
+const KR_RE  = /[\uac00-\ud7af]/;
+
+function injectLanguageHint(msgs) {
+  if (!Array.isArray(msgs)) return;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i]?.role !== 'user') continue;
+    const c = msgs[i].content;
+    const text = typeof c === 'string' ? c
+      : Array.isArray(c) ? c.filter(p => p?.type === 'text').map(p => p.text).join('') : '';
+    let hint = '';
+    if (CJK_RE.test(text))      hint = '\n\n[IMPORTANT: You MUST respond entirely in Chinese (中文). Do not switch to English.]';
+    else if (JP_RE.test(text))  hint = '\n\n[IMPORTANT: You MUST respond entirely in Japanese (日本語).]';
+    else if (KR_RE.test(text))  hint = '\n\n[IMPORTANT: You MUST respond entirely in Korean (한국어).]';
+    if (!hint) break;
+    msgs[i] = { ...msgs[i] };
+    if (typeof msgs[i].content === 'string') {
+      msgs[i].content += hint;
+    } else if (Array.isArray(msgs[i].content)) {
+      msgs[i].content = [...msgs[i].content, { type: 'text', text: hint }];
+    }
+    break;
+  }
+}
 const CASCADE_REUSE_STRICT = process.env.CASCADE_REUSE_STRICT === '1';
 const CASCADE_REUSE_STRICT_RETRY_MS = (() => {
   const n = parseInt(process.env.CASCADE_REUSE_STRICT_RETRY_MS || '', 10);
@@ -198,6 +232,9 @@ export async function handleChatCompletions(body) {
   let cascadeMessages = emulateTools
     ? normalizeMessagesForCascade(messages, tools)
     : [...messages];
+
+  // Language-following hint for CJK users (#35)
+  if (useCascade) injectLanguageHint(cascadeMessages);
 
   // ── Model identity prompt injection ──
   // When enabled, prepend a system message so the model identifies itself as
