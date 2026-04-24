@@ -271,6 +271,21 @@ export async function handleChatCompletions(body) {
   } = body;
   let messages = body.messages;
 
+  // Probe-mode diagnostics: when the incoming request has the shape of a
+  // third-party verification probe (response_format, tools with json, or
+  // any non-text content block), log a compact description so we can tell
+  // whether upstream tests are routing correctly.
+  try {
+    const hasNonText = Array.isArray(messages) && messages.some(m => Array.isArray(m?.content) && m.content.some(p => p?.type && p.type !== 'text'));
+    if (response_format || hasNonText) {
+      const contentTypes = new Set();
+      for (const m of (messages || [])) {
+        if (Array.isArray(m.content)) for (const p of m.content) contentTypes.add(p?.type || typeof p);
+      }
+      log.info(`Probe[${reqId}]: model=${reqModel} rf=${response_format?.type || 'none'} tools=${Array.isArray(tools) ? tools.length : 0} contentTypes=[${[...contentTypes].join(',')}] turns=${messages?.length || 0}`);
+    }
+  } catch {}
+
   const wantJson = response_format?.type === 'json_object' || response_format?.type === 'json_schema';
   if (wantJson) {
     let jsonHint = '\n\n[You MUST respond with valid JSON only. No markdown code fences, no explanation text, no prefix/suffix. Your entire response must be a single parseable JSON object.';
