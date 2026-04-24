@@ -1631,9 +1631,7 @@ window._firebaseOAuth = async function(provider) {
             <div class="text-sm text-muted" data-i18n="section.identityPrompt.hint">默认开启；关闭后下面的模板不起作用</div>
           </div>
         </div>
-        <div class="section-desc" style="margin-bottom:10px">
-          ${I18n.t('section.identityPrompt.templateHint')}
-        </div>
+        <div class="section-desc" style="margin-bottom:10px" data-i18n="section.identityPrompt.templateHint">每个厂商的模板可编辑，{{model}} 占位符会被替换成请求的模型名（例如 claude-opus-4.6）。</div>
         <div style="margin-bottom:10px"><input type="text" class="input" data-i18n-placeholder="field.searchProvider.placeholder" placeholder="搜索提供商..." id="identity-search" oninput="App.filterIdentityPrompts(this.value)" style="max-width:280px"></div>
         <div id="identity-prompts-editor" style="display:grid;gap:14px"></div>
       </div>
