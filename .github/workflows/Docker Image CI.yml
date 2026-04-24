@@ -1,8 +1,8 @@
 name: Docker Image CI
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [master]
   workflow_dispatch:
     inputs:
       tag:
@@ -19,8 +19,8 @@ jobs:
   # Stage 1: Build per architecture
   # ==========================================
   build:
-    name: Build ${{ matrix.platform.arch }}
-    runs-on: ${{ matrix.platform.runner }}
+    name: Build $ matrix.platform.arch 
+    runs-on: $ matrix.platform.runner 
     strategy:
       fail-fast: false
       matrix:
@@ -40,30 +40,33 @@ jobs:
       - name: Prepare variables
         run: |
           echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "IMAGE_TAG=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
+          if [ "$ github.event_name " = "push" ]; then
+            SHORT_SHA=$(echo "$ github.sha " | cut -c1-7)
+            echo "IMAGE_TAG=${SHORT_SHA}" >> $GITHUB_ENV
+          elif [ "$ github.event_name " = "workflow_dispatch" ]; then
+            echo "IMAGE_TAG=$ github.event.inputs.tag " >> $GITHUB_ENV
           else
-            echo "IMAGE_TAG=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+            echo "IMAGE_TAG=$ github.event.inputs.tag " >> $GITHUB_ENV
           fi
 
       - name: Login to GHCR
         uses: docker/login-action@v3.3.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: $ github.actor 
+          password: $ secrets.GITHUB_TOKEN 
 
       - name: Build and push by architecture
         uses: docker/build-push-action@v6.10.0
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/${{ matrix.platform.arch }}
+          platforms: linux/$ matrix.platform.arch 
           push: true
           tags: |
-            ghcr.io/${{ env.OWNER_LC }}/windsurf-api:${{ env.IMAGE_TAG }}-${{ matrix.platform.arch }}
-          cache-from: type=gha,scope=build-${{ matrix.platform.arch }}
-          cache-to: type=gha,mode=max,scope=build-${{ matrix.platform.arch }}
+            ghcr.io/$ env.OWNER_LC /windsurf-api:$ env.IMAGE_TAG -$ matrix.platform.arch 
+          cache-from: type=gha,scope=build-$ matrix.platform.arch 
+          cache-to: type=gha,mode=max,scope=build-$ matrix.platform.arch 
 
   # ==========================================
   # Stage 2: Merge multi-arch manifest
@@ -80,23 +83,26 @@ jobs:
       - name: Prepare variables
         run: |
           echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
-          if [ "${{ github.event_name }}" = "release" ]; then
-            echo "IMAGE_TAG=${{ github.event.release.tag_name }}" >> $GITHUB_ENV
+          if [ "$ github.event_name " = "push" ]; then
+            SHORT_SHA=$(echo "$ github.sha " | cut -c1-7)
+            echo "IMAGE_TAG=${SHORT_SHA}" >> $GITHUB_ENV
+          elif [ "$ github.event_name " = "workflow_dispatch" ]; then
+            echo "IMAGE_TAG=$ github.event.inputs.tag " >> $GITHUB_ENV
           else
-            echo "IMAGE_TAG=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+            echo "IMAGE_TAG=$ github.event.inputs.tag " >> $GITHUB_ENV
           fi
 
       - name: Login to GHCR
         uses: docker/login-action@v3.3.0
         with:
           registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: $ github.actor 
+          password: $ secrets.GITHUB_TOKEN 
 
       - name: Create multi-arch manifest and push
         run: |
           docker buildx imagetools create \
-            -t ghcr.io/${{ env.OWNER_LC }}/windsurf-api:${{ env.IMAGE_TAG }} \
-            -t ghcr.io/${{ env.OWNER_LC }}/windsurf-api:latest \
-            ghcr.io/${{ env.OWNER_LC }}/windsurf-api:${{ env.IMAGE_TAG }}-amd64 \
-            ghcr.io/${{ env.OWNER_LC }}/windsurf-api:${{ env.IMAGE_TAG }}-arm64
+            -t ghcr.io/$ env.OWNER_LC /windsurf-api:$ env.IMAGE_TAG  \
+            -t ghcr.io/$ env.OWNER_LC /windsurf-api:latest \
+            ghcr.io/$ env.OWNER_LC /windsurf-api:$ env.IMAGE_TAG -amd64 \
+            ghcr.io/$ env.OWNER_LC /windsurf-api:$ env.IMAGE_TAG -arm64
