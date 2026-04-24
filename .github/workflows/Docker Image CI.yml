@@ -2,13 +2,17 @@ name: Docker Image CI
 
 on:
   push:
-    branches: [master]
+    branches: [master, test]
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Image tag'
-        required: true
-        default: 'manual'
+        description: 'Image tag (leave empty for auto short SHA)'
+        required: false
+        default: ''
+      branch:
+        description: 'Branch to build from (leave empty for current)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -33,6 +37,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3.8.0
@@ -40,13 +46,26 @@ jobs:
       - name: Prepare variables
         run: |
           echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
+          # Determine branch name
+          BRANCH="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.branch }}" ]; then
+            BRANCH="${{ github.event.inputs.branch }}"
+          fi
+          # Determine base tag
           if [ "${{ github.event_name }}" = "push" ]; then
             SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-            echo "IMAGE_TAG=${SHORT_SHA}" >> $GITHUB_ENV
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "IMAGE_TAG=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+            BASE_TAG="$SHORT_SHA"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
+            BASE_TAG="${{ github.event.inputs.tag }}"
           else
-            echo "IMAGE_TAG=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            BASE_TAG="$SHORT_SHA"
+          fi
+          # Prefix with branch name if not master
+          if [ "$BRANCH" != "master" ]; then
+            echo "IMAGE_TAG=$BRANCH-$BASE_TAG" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=$BASE_TAG" >> $GITHUB_ENV
           fi
 
       - name: Login to GHCR
@@ -83,13 +102,26 @@ jobs:
       - name: Prepare variables
         run: |
           echo "OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
+          # Determine branch name
+          BRANCH="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.branch }}" ]; then
+            BRANCH="${{ github.event.inputs.branch }}"
+          fi
+          # Determine base tag
           if [ "${{ github.event_name }}" = "push" ]; then
             SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-            echo "IMAGE_TAG=${SHORT_SHA}" >> $GITHUB_ENV
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "IMAGE_TAG=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+            BASE_TAG="$SHORT_SHA"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
+            BASE_TAG="${{ github.event.inputs.tag }}"
           else
-            echo "IMAGE_TAG=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+            SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+            BASE_TAG="$SHORT_SHA"
+          fi
+          # Prefix with branch name if not master
+          if [ "$BRANCH" != "master" ]; then
+            echo "IMAGE_TAG=$BRANCH-$BASE_TAG" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=$BASE_TAG" >> $GITHUB_ENV
           fi
 
       - name: Login to GHCR
@@ -101,8 +133,15 @@ jobs:
 
       - name: Create multi-arch manifest and push
         run: |
+          BRANCH="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.branch }}" ]; then
+            BRANCH="${{ github.event.inputs.branch }}"
+          fi
+          TAGS="-t ghcr.io/${{ env.OWNER_LC }}/windsurf-api:${{ env.IMAGE_TAG }}"
+          if [ "$BRANCH" = "master" ]; then
+            TAGS="$TAGS -t ghcr.io/${{ env.OWNER_LC }}/windsurf-api:latest"
+          fi
           docker buildx imagetools create \
-            -t ghcr.io/${{ env.OWNER_LC }}/windsurf-api:${{ env.IMAGE_TAG }} \
-            -t ghcr.io/${{ env.OWNER_LC }}/windsurf-api:latest \
+            $TAGS \
             ghcr.io/${{ env.OWNER_LC }}/windsurf-api:${{ env.IMAGE_TAG }}-amd64 \
             ghcr.io/${{ env.OWNER_LC }}/windsurf-api:${{ env.IMAGE_TAG }}-arm64
