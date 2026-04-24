@@ -501,7 +501,12 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         if (c.text) allText += c.text;
         if (c.thinking) allThinking += c.thinking;
       }
-      cascadeMeta = { cascadeId: chunks.cascadeId, sessionId: chunks.sessionId };
+      cascadeMeta = {
+        cascadeId: chunks.cascadeId,
+        sessionId: chunks.sessionId,
+        stepOffset: chunks.stepOffset,
+        generatorOffset: chunks.generatorOffset,
+      };
       serverUsage = chunks.usage || null;
       // Always strip <tool_call>/<tool_result> blocks from Cascade text.
       // - emulateTools=true: parsed tool_calls become OpenAI-format tool_calls.
@@ -543,6 +548,8 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         sessionId: cascadeMeta.sessionId,
         lsPort: poolCtx.lsPort,
         apiKey: poolCtx.apiKey,
+        stepOffset: Number.isFinite(cascadeMeta.stepOffset) ? cascadeMeta.stepOffset : poolCtx.reuseEntry?.stepOffset,
+        generatorOffset: Number.isFinite(cascadeMeta.generatorOffset) ? cascadeMeta.generatorOffset : poolCtx.reuseEntry?.generatorOffset,
         createdAt: poolCtx.reuseEntry?.createdAt,
       });
     }
@@ -921,6 +928,8 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
                 sessionId: cascadeResult.sessionId,
                 lsPort: ls.port,
                 apiKey: currentApiKey,
+                stepOffset: Number.isFinite(cascadeResult.stepOffset) ? cascadeResult.stepOffset : reuseEntry?.stepOffset,
+                generatorOffset: Number.isFinite(cascadeResult.generatorOffset) ? cascadeResult.generatorOffset : reuseEntry?.generatorOffset,
                 createdAt: reuseEntry?.createdAt,
               });
             }
