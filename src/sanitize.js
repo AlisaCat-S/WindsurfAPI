@@ -32,13 +32,18 @@ const _repoRoot = (() => {
 })();
 
 const PATTERNS = [
-  [/\/tmp\/windsurf-workspace(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
-  // Cascade's sandbox workspace (per-account wsId). The model sees this path
-  // in its context because we AddTrackedWorkspace on it, then helpfully
-  // suggests it in tool calls — Claude Code then runs Read/Glob against
-  // a path that doesn't exist on the user's machine (issue #38). Rewrite
-  // to "." so the tool call falls back to cwd, which IS the user's project.
-  [/\/home\/user\/projects\/workspace-[a-z0-9]+(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
+  // Cascade's sandbox workspace paths. Previously we rewrote to "./tail" so
+  // a leaked `/tmp/windsurf-workspace/src/main.py` would become `./src/main.py`
+  // and fall back to the user's actual cwd. Turned out to be an antifeature:
+  // Cascade frequently hallucinates these paths (narrates "I viewed
+  // /tmp/windsurf-workspace/config.yaml" purely from its training prior, not
+  // from any real read), and after the rewrite Claude Code would try to Read
+  // `./config.yaml`, get a not-found error, retry, and loop — issue #24
+  // "Cascade cites files that don't exist, keeps looping." Flatten the whole
+  // path to a neutral [internal] marker so a leaked reference can't be
+  // mistaken for a real local file.
+  [/\/tmp\/windsurf-workspace(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]'],
+  [/\/home\/user\/projects\/workspace-[a-z0-9]+(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]'],
   [/\/opt\/windsurf(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]'],
   [new RegExp(_repoRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:\\/[^\\s"\'`<>)}\\],*;]*)?', 'g'), '[internal]'],
 ];
