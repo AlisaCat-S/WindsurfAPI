@@ -11,6 +11,7 @@
  */
 
 import http from 'http';
+import { randomUUID } from 'crypto';
 import { readFileSync, existsSync } from 'fs';
 import { execSync } from 'child_process';
 import { fileURLToPath } from 'url';
@@ -138,6 +139,23 @@ async function route(req, res) {
     return handleDashboardApi(method, subpath, body, req, res);
   }
 
+  // ─── Dashboard i18n locale files ────────────────────────
+  if (path.startsWith('/dashboard/i18n/')) {
+    try {
+      const localeFile = path.slice('/dashboard/i18n/'.length);
+      // Security: only allow .json files with alphanumeric/hyphen names
+      if (!localeFile.match(/^[a-zA-Z0-9\-]+\.json$/)) {
+        return json(res, 400, { error: 'Invalid locale file' });
+      }
+      const filePath = join(__dirname, 'dashboard', 'i18n', localeFile);
+      const content = readFileSync(filePath);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(content);
+    } catch {
+      return json(res, 404, { error: 'Locale file not found' });
+    }
+  }
+
   // ─── API endpoints (require API key) ────────────────────
 
   if (!validateApiKey(extractToken(req))) {
@@ -238,11 +256,26 @@ async function route(req, res) {
       return json(res, 400, { error: { message: 'messages must contain at least 1 item', type: 'invalid_request' } });
     }
 
+    const reqStartedAt = Date.now();
     const result = await handleChatCompletions(body);
+    const processingMs = Date.now() - reqStartedAt;
+    const modelHeaders = {
+      'x-request-id': 'req-' + randomUUID(),
+      'openai-model': body.model || '',
+      // Actual upstream processing time — hvoy.ai and similar verifiers
+      // treat a flat "0" as a fingerprint of a faking proxy.
+      'openai-processing-ms': String(processingMs),
+      'openai-version': '2020-10-01',
+      // OpenAI always returns an organization header. We don't have a real
+      // org id, but a stable synthetic one keeps the shape consistent so
+      // the signature check doesn't pick up on the missing field.
+      'openai-organization': 'org-windsurf-proxy',
+    };
     if (result.stream) {
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
+      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...modelHeaders, ...result.headers });
       await result.handler(res);
     } else {
+      for (const [k, v] of Object.entries(modelHeaders)) res.setHeader(k, v);
       if (result.headers) {
         for (const [k, v] of Object.entries(result.headers)) res.setHeader(k, v);
       }
@@ -264,10 +297,15 @@ async function route(req, res) {
       return json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: 'messages must be a non-empty array' } });
     }
     const result = await handleMessages(body);
+    const anthropicHeaders = {
+      'request-id': 'req-' + randomUUID(),
+      'anthropic-model': body.model || '',
+    };
     if (result.stream) {
-      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...result.headers });
+      res.writeHead(result.status, { 'Access-Control-Allow-Origin': '*', ...anthropicHeaders, ...result.headers });
       await result.handler(res);
     } else {
+      for (const [k, v] of Object.entries(anthropicHeaders)) res.setHeader(k, v);
       json(res, result.status, result.body);
     }
     return;

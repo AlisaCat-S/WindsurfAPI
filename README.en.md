@@ -25,21 +25,26 @@ Turns [Windsurf](https://windsurf.com) (formerly Codeium)'s AI models into **two
 
 ## What is it doing?
 
-```
-     ┌─────────────┐   /v1/chat/completions   ┌────────────┐
-     │ OpenAI SDK  │ ──────────────────────→  │            │
-     │ curl / Frontend │ ←──────────────────────  │            │
-     └─────────────┘   OpenAI JSON + SSE      │ WindsurfAPI│
-                                              │ Node.js    │      ┌──────────────┐       ┌─────────────────┐
-     ┌─────────────┐   /v1/messages           │ (This Service)   │ gRPC │ Language     │ HTTPS │ Windsurf Cloud  │
-     │ Claude Code │ ──────────────────────→  │            │ ───→ │ Server (LS)  │ ────→ │ server.self-    │
-     │ Cline       │ ←──────────────────────  │            │ ←─── │ (Windsurf    │ ←─── │ serve.windsurf  │
-     │ Cursor      │   Anthropic SSE          │            │      │  binary)     │       │ .com            │
-     └─────────────┘                          └────────────┘      └──────────────┘       └─────────────────┘
-                                                    ↑
-                                           Account Pool Round-Robin
-                                            Rate Limit Isolation
-                                                   Failover
+```mermaid
+flowchart LR
+    subgraph Clients
+        A[OpenAI SDK<br>curl / Frontend]
+        B[Claude Code<br>Cline<br>Cursor]
+    end
+
+    subgraph WindsurfAPI["WindsurfAPI (Node.js)"]
+        C[HTTP Service<br>Port 3003]
+        D[Account Pool<br>Round-Robin<br>Rate Limit<br>Failover]
+    end
+
+    E["Language Server<br>(Windsurf binary)"]
+    F[Windsurf Cloud<br>server.self-serve.windsurf.com]
+
+    A -->|"/v1/chat/completions"<br>OpenAI JSON + SSE| C
+    B -->|"/v1/messages"<br>Anthropic SSE| C
+    C <-->|gRPC| E
+    E <-->|HTTPS| F
+    D -.-> C
 ```
 
 **What it does**:
@@ -52,29 +57,26 @@ Turns [Windsurf](https://windsurf.com) (formerly Codeium)'s AI models into **two
 
 The model itself does **not** operate on files — file operations are executed locally by the IDE Agent client (Claude Code, Cline, etc.):
 
-```
- You "Help me fix a bug"         Claude Code                    WindsurfAPI               Windsurf Cloud
-   │                                │                               │                          │
-   │────────────────────────────→  │                               │                          │
-   │                                │  POST /v1/messages            │                          │
-   │                                │  messages + tools + system    │                          │
-   │                                │ ─────────────────────────────→│ Package into Cascade request │
-   │                                │                               │ ──────────────────────→  │
-   │                                │                               │                          │
-   │                                │                               │               Model thinks → returns
-   │                                │                               │               tool_use(edit_file)
-   │                                │                               │ ←──────────────────────  │
-   │                                │ ←── Anthropic SSE ────────────│                          │
-   │                                │   content_block=tool_use      │                          │
-   │                                │                               │                          │
-   │                                │ Execute edit_file() locally   │                          │
-   │                                │ (Read/write local files)      │                          │
-   │                                │                               │                          │
-   │                                │ Send another turn with tool_result │                          │
-   │                                │ ─────────────────────────────→│ ──────────────────────→  │
-   │                                │                                             ... (loop) ...
-   │                                │                               │                          │
-   │  ← Final answer                │                               │                          │
+```mermaid
+sequenceDiagram
+    actor U as You
+    participant CC as Claude Code
+    participant WA as WindsurfAPI
+    participant WC as Windsurf Cloud
+
+    U->>CC: "Help me fix a bug"
+    CC->>WA: POST /v1/messages<br>messages + tools + system
+    WA->>WC: Package into Cascade request
+    WC-->>WA: Model thinks → returns<br>tool_use(edit_file)
+    WA-->>CC: Anthropic SSE<br>content_block=tool_use
+    CC->>CC: Execute edit_file() locally<br>(Read/write local files)
+    CC->>WA: Send tool_result
+    WA->>WC: Continue conversation...
+    loop Conversation Loop
+        WC-->>WA: Response
+        WA-->>CC: SSE stream
+    end
+    CC-->>U: Final answer
 ```
 
 **Key Point**: WindsurfAPI is only responsible for **passing** `tool_use` / `tool_result`. The client CLI is what actually modifies the files.
@@ -165,6 +167,10 @@ LS_PORT=42100
 DASHBOARD_PASSWORD=
 EOF
 
+# Note: Inline comments are supported in .env for unquoted values:
+#   PORT=3003  # Service port
+# Quoted values preserve everything inside the quotes.
+
 node src/index.js
 ```
 
@@ -181,16 +187,16 @@ Open `http://YOUR_IP:3003/dashboard` → Login to get token → Click **Sign in 
 Go to [windsurf.com/show-auth-token](https://windsurf.com/show-auth-token) to copy your token:
 
 ```bash
-curl -X POST http://localhost:3003/auth/login 
-  -H "Content-Type: application/json" 
+curl -X POST http://localhost:3003/auth/login
+  -H "Content-Type: application/json"
   -d '{"token": "YOUR_TOKEN"}'
 ```
 
 **Method 3: Batch**
 
 ```bash
-curl -X POST http://localhost:3003/auth/login 
-  -H "Content-Type: application/json" 
+curl -X POST http://localhost:3003/auth/login
+  -H "Content-Type: application/json"
   -d '{"accounts": [{"token": "t1"}, {"token": "t2"}]}'
 ```
 
@@ -218,9 +224,9 @@ claude                # Use Claude Code as usual
 
 ```bash
 # Raw curl test
-curl http://localhost:3003/v1/messages 
-  -H "Authorization: Bearer YOUR_KEY" 
-  -H "anthropic-version: 2023-06-01" 
+curl http://localhost:3003/v1/messages
+  -H "Authorization: Bearer YOUR_KEY"
+  -H "anthropic-version: 2023-06-01"
   -d '{"model":"claude-opus-4.6","max_tokens":100,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
@@ -250,12 +256,21 @@ In your client's settings for **Custom OpenAI Compatible**:
 | `PORT` | `3003` | Service port |
 | `API_KEY` | empty | API key required for requests. Leave empty to disable validation. |
 | `DATA_DIR` | project root | Directory for persisted JSON state and `logs/`. Docker deployments should usually use `/data`. |
+| `CODEIUM_API_KEY` | empty | Direct API key from Windsurf (alternative to token-based auth). |
+| `CODEIUM_AUTH_TOKEN` | empty | Token from [windsurf.com/show-auth-token](https://windsurf.com/show-auth-token). |
+| `CODEIUM_EMAIL` | empty | Email for Windsurf account authentication. |
+| `CODEIUM_PASSWORD` | empty | Password for Windsurf account authentication. |
+| `CODEIUM_API_URL` | `https://server.self-serve.windsurf.com` | Windsurf cloud API endpoint. |
 | `DEFAULT_MODEL` | `claude-4.5-sonnet-thinking` | The model to use if `model` is not specified. |
 | `MAX_TOKENS` | `8192` | Default maximum number of response tokens. |
 | `LOG_LEVEL` | `info` | debug / info / warn / error |
 | `LS_BINARY_PATH` | `/opt/windsurf/language_server_linux_x64` | Path to the LS binary. |
 | `LS_PORT` | `42100` | LS gRPC port. |
+| `LS_DATA_DIR` | `/opt/windsurf` | Per-proxy LS data directory root. |
 | `DASHBOARD_PASSWORD` | empty | Dashboard password. Leave empty for no password. |
+| `CASCADE_REUSE_STRICT` | `0` | Set to `1` for strict conversation reuse mode (waits for same fingerprint). |
+| `CASCADE_REUSE_STRICT_RETRY_MS` | `60000` | Retry delay in ms for strict reuse mode. |
+| `CASCADE_REUSE_HASH_SYSTEM` | `0` | Set to `1` to include system messages in conversation reuse hash. |
 
 ## Dashboard Features
 
@@ -305,6 +320,10 @@ deepseek-v3 / v3-2 / r1 · grok-3 / mini / mini-thinking / code-fast-1 · qwen-3
 </details>
 
 > **Free accounts** can only use `gpt-4o-mini` and `gemini-2.5-flash`. Others require Windsurf Pro.
+
+### Language-Following for CJK Users
+
+The service automatically detects Chinese, Japanese, or Korean characters in your messages and injects a language-following hint to ensure the model responds in the same language. This fixes the issue where Claude Code's large English system prompt would override the communication language.
 
 ## Architecture Highlights
 
@@ -364,6 +383,13 @@ Huge thanks to the following folks who sent pull requests or systematically audi
   Fixed the Pro tier model-merge logic: the hardcoded table wasn't picking up dynamically-fetched cloud models, so Pro accounts couldn't see newly-released models in Cursor / Cherry Studio.
 - [@colin1112a](https://github.com/colin1112a) — [PR #13](https://github.com/dwgx/WindsurfAPI/pull/13)
   A single-shot audit that flagged 15 security / concurrency / resource bugs: XSS escaping, shell injection, OOM guards, auth route placement, gRPC double-callback, LS pool race, HTTP/2 frame size caps, and more. On top of this we later added a JS-level `escJsAttr`, coalesced concurrent `ensureLs` calls via `_pending`, released pooled sessions on LS exit, and fixed 6 more issues surfaced by a follow-up Antigravity audit.
+- [@baily-zhang](https://github.com/baily-zhang) — [PR #36](https://github.com/dwgx/WindsurfAPI/pull/36) + [PR #45](https://github.com/dwgx/WindsurfAPI/pull/45)
+  Core Cascade reuse fixes: stableTurns fingerprinting (#36) solved 0% hit rate; trajectory offset tracking (#45) eliminated context bloat during multi-turn reuse.
+- [@aict666](https://github.com/aict666) — [PR #44](https://github.com/dwgx/WindsurfAPI/pull/44)
+  Fixed inferTier demoting Pro/Trial accounts to free after every chat call, preserving the authoritative tier from GetUserStatus.
+- [@smeinecke](https://github.com/smeinecke) — [PR #43](https://github.com/dwgx/WindsurfAPI/pull/43)
+  Full Dashboard i18n: 14 commits covering Chinese/English translations, I18n system, and check-i18n.js validation tool.
+
 Want to be on this list? Open an [issue](https://github.com/dwgx/WindsurfAPI/issues) or a [pull request](https://github.com/dwgx/WindsurfAPI/pulls). The dashboard has a Credits panel on the left that shows the same info.
 
 ## License

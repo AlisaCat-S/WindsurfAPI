@@ -84,8 +84,8 @@ export function recordRequest(model, success, durationMs, accountId) {
   if (!bucket) {
     bucket = { hour: hourKey, requests: 0, errors: 0 };
     _state.hourlyBuckets.push(bucket);
-    // Keep last 72 hours
-    if (_state.hourlyBuckets.length > 72) _state.hourlyBuckets.shift();
+    // Keep last 30 days of hourly data (720 buckets)
+    if (_state.hourlyBuckets.length > 720) _state.hourlyBuckets.shift();
   }
   bucket.requests++;
   if (!success) bucket.errors++;

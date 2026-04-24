@@ -266,7 +266,7 @@ export class WindsurfClient {
    * @param {object} opts - { onChunk, onEnd, onError }
    */
   async cascadeChat(messages, modelEnum, modelUid, opts = {}) {
-    const { onChunk, onEnd, onError, signal, reuseEntry, toolPreamble } = opts;
+    let { onChunk, onEnd, onError, signal, reuseEntry, toolPreamble, displayModel } = opts;
     const aborted = () => signal?.aborted;
     const inputChars = messages.reduce((n, m) => n + contentToString(m?.content).length, 0);
 
@@ -311,6 +311,42 @@ export class WindsurfClient {
         cascadeId = await openCascade();
       }
 
+      // A resumed cascade already contains every prior turn in its trajectory.
+      // If we poll from step offset 0 again, the old planner-response steps are
+      // replayed as fresh output and both text and usage grow cumulatively
+      // across turns (`alpha` -> `alphabeta` -> ...). Store absolute offsets in
+      // the conversation pool and reuse them here; fall back to a one-shot
+      // snapshot so entries created before this fix still resume safely.
+      let stepOffset = Number.isInteger(reuseEntry?.stepOffset) && reuseEntry.stepOffset >= 0
+        ? reuseEntry.stepOffset
+        : 0;
+      let generatorOffset = Number.isInteger(reuseEntry?.generatorOffset) && reuseEntry.generatorOffset >= 0
+        ? reuseEntry.generatorOffset
+        : 0;
+      if (reuseEntry?.cascadeId && (!Number.isInteger(reuseEntry?.stepOffset) || !Number.isInteger(reuseEntry?.generatorOffset))) {
+        try {
+          if (!Number.isInteger(reuseEntry?.stepOffset)) {
+            const resumeStepsResp = await grpcUnary(
+              this.port, this.csrfToken,
+              `${LS_SERVICE}/GetCascadeTrajectorySteps`,
+              grpcFrame(buildGetTrajectoryStepsRequest(cascadeId, 0))
+            );
+            stepOffset = parseTrajectorySteps(resumeStepsResp).length;
+          }
+          if (!Number.isInteger(reuseEntry?.generatorOffset)) {
+            const resumeMetaResp = await grpcUnary(
+              this.port, this.csrfToken,
+              `${LS_SERVICE}/GetCascadeTrajectoryGeneratorMetadata`,
+              grpcFrame(buildGetGeneratorMetadataRequest(cascadeId, 0)),
+              5000
+            );
+            generatorOffset = parseGeneratorMetadata(resumeMetaResp)?.entryCount || 0;
+          }
+        } catch (e) {
+          log.warn(`Cascade resume snapshot failed: ${e.message}`);
+        }
+      }
+
       let text;
       let images = [];
       const systemMsgs = messages.filter(m => m.role === 'system');
@@ -327,6 +363,17 @@ export class WindsurfClient {
       // on. Routing via additional_instructions_section (field 12) was
       // tried and rejected by the backend on ≥ 1 KB payloads.
       if (sysText) sysText = neutralizeIdentityForCascade(sysText);
+
+      const modelLabel = modelUid
+        ? modelUid.replace(/^MODEL_/i, '').replace(/_/g, ' ').toLowerCase()
+        : `model-${modelEnum}`;
+      const providerMap = { claude: 'Anthropic', gpt: 'OpenAI', gemini: 'Google', deepseek: 'DeepSeek', grok: 'xAI', qwen: 'Alibaba', kimi: 'Moonshot', glm: 'Zhipu', swe: 'Windsurf' };
+      const providerKey = Object.keys(providerMap).find(k => modelLabel.includes(k)) || '';
+      const provider = providerMap[providerKey] || '';
+      if (provider) {
+        const ctx = `[Context: The underlying model serving this request is ${opts.displayModel || modelLabel}, developed by ${provider}.]`;
+        sysText = sysText ? sysText + '\n' + ctx : ctx;
+      }
 
       const isResume = !!reuseEntry;
 
@@ -443,7 +490,7 @@ export class WindsurfClient {
         pollCount++;
 
         // Get steps
-        const stepsProto = buildGetTrajectoryStepsRequest(cascadeId, 0);
+        const stepsProto = buildGetTrajectoryStepsRequest(cascadeId, stepOffset);
         const stepsResp = await grpcUnary(
           this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(stepsProto)
         );
@@ -615,6 +662,7 @@ export class WindsurfClient {
               this.port, this.csrfToken, `${LS_SERVICE}/GetCascadeTrajectorySteps`, grpcFrame(stepsProto)
             );
             const finalSteps = parseTrajectorySteps(finalResp);
+            lastStepCount = finalSteps.length;
             for (let i = 0; i < finalSteps.length; i++) {
               const step = finalSteps[i];
               const responseText = step.responseText || '';
@@ -662,7 +710,7 @@ export class WindsurfClient {
         polls: pollCount,
         textLen: totalYielded,
         thinkingLen: totalThinking,
-        stepCount: Math.max(yieldedByStep.size, thinkingByStep.size, lastStepCount),
+        stepCount: stepOffset + Math.max(yieldedByStep.size, thinkingByStep.size, lastStepCount),
         toolCalls: seenToolCallIds.size,
         sawActive,
         sawText,
@@ -686,7 +734,7 @@ export class WindsurfClient {
       // itself is already formed.
       let serverUsage = null;
       try {
-        const metaReq = buildGetGeneratorMetadataRequest(cascadeId, 0);
+        const metaReq = buildGetGeneratorMetadataRequest(cascadeId, generatorOffset);
         const metaResp = await grpcUnary(
           this.port, this.csrfToken,
           `${LS_SERVICE}/GetCascadeTrajectoryGeneratorMetadata`,
@@ -722,6 +770,10 @@ export class WindsurfClient {
       // that iterate over it keep working.
       chunks.cascadeId = cascadeId;
       chunks.sessionId = sessionId;
+      chunks.stepOffset = stepOffset + Math.max(yieldedByStep.size, thinkingByStep.size, lastStepCount);
+      chunks.generatorOffset = serverUsage?.entryCount != null
+        ? generatorOffset + serverUsage.entryCount
+        : null;
       chunks.toolCalls = toolCalls;
       chunks.usage = serverUsage;
       if (serverUsage) {

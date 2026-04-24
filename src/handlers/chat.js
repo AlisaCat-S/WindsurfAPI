@@ -12,7 +12,7 @@ import { config, log } from '../config.js';
 import { recordRequest } from '../dashboard/stats.js';
 import { isModelAllowed } from '../dashboard/model-access.js';
 import { cacheKey, cacheGet, cacheSet } from '../cache.js';
-import { isExperimentalEnabled, getIdentityPromptFor } from '../runtime-config.js';
+import { isExperimentalEnabled } from '../runtime-config.js';
 import { checkMessageRateLimit } from '../windsurf-api.js';
 import { getEffectiveProxy } from '../dashboard/proxy-config.js';
 import {
@@ -28,54 +28,63 @@ const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
 
-// ── Language-following reinforcement ──────────────────────────
-// Claude Code injects ~100KB of English system prompt + tool definitions
-// into the conversation, which drowns out the communication_section
-// (proto field 13) language instruction. Detecting CJK characters in the
-// user's latest message and appending a brief reminder directly into the
-// message content ensures the model sees it at the point of highest
-// attention. Only modifies cascadeMessages (not the original messages
-// used for fingerprinting). (#35)
-const CJK_RE = /[\u4e00-\u9fff\u3400-\u4dbf]/;
-const JP_RE  = /[\u3040-\u309f\u30a0-\u30ff]/;
-const KR_RE  = /[\uac00-\ud7af]/;
-
-function injectLanguageHint(msgs) {
-  if (!Array.isArray(msgs)) return;
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i]?.role !== 'user') continue;
-    const c = msgs[i].content;
-    const text = typeof c === 'string' ? c
-      : Array.isArray(c) ? c.filter(p => p?.type === 'text').map(p => p.text).join('') : '';
-    let hint = '';
-    if (CJK_RE.test(text))      hint = '\n\n[IMPORTANT: You MUST respond entirely in Chinese (中文). Do not switch to English.]';
-    else if (JP_RE.test(text))  hint = '\n\n[IMPORTANT: You MUST respond entirely in Japanese (日本語).]';
-    else if (KR_RE.test(text))  hint = '\n\n[IMPORTANT: You MUST respond entirely in Korean (한국어).]';
-    if (!hint) break;
-    msgs[i] = { ...msgs[i] };
-    if (typeof msgs[i].content === 'string') {
-      msgs[i].content += hint;
-    } else if (Array.isArray(msgs[i].content)) {
-      msgs[i].content = [...msgs[i].content, { type: 'text', text: hint }];
-    }
-    break;
+/**
+ * Extract a clean JSON payload from a model response. Handles three common
+ * shapes a non-constrained-decoding model produces when asked for JSON:
+ *
+ *   1. Fenced code block:   ```json\n{...}\n```
+ *   2. Preamble + fence:    Here is the JSON:\n```\n{...}\n```
+ *   3. Bare JSON with noise: Sure! {...} Let me know if ...
+ *
+ * Returns the raw (unparsed) JSON substring so the caller can serialize it
+ * straight through. Falls back to the trimmed original text if nothing
+ * parseable is found, matching what OpenAI's json_object mode does when the
+ * model produces invalid JSON (the response still flows, parsing is the
+ * caller's responsibility).
+ */
+function extractJsonPayload(text) {
+  if (!text) return text;
+  // 1. Fenced code block — most common with Cascade
+  const fence = text.match(/```(?:json|JSON)?\s*\n?([\s\S]*?)\n?```/);
+  if (fence) {
+    const inner = fence[1].trim();
+    try { JSON.parse(inner); return inner; } catch { /* fall through */ }
   }
+  // 2. Scan for the first balanced {...} or [...] block that parses
+  const trimmed = text.trim();
+  for (let start = 0; start < trimmed.length; start++) {
+    const ch = trimmed[start];
+    if (ch !== '{' && ch !== '[') continue;
+    const open = ch;
+    const close = ch === '{' ? '}' : ']';
+    let depth = 0;
+    let inStr = false;
+    let escape = false;
+    for (let i = start; i < trimmed.length; i++) {
+      const c = trimmed[i];
+      if (escape) { escape = false; continue; }
+      if (c === '\\' && inStr) { escape = true; continue; }
+      if (c === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (c === open) depth++;
+      else if (c === close) {
+        depth--;
+        if (depth === 0) {
+          const candidate = trimmed.slice(start, i + 1);
+          try { JSON.parse(candidate); return candidate; } catch { /* keep scanning */ }
+          break;
+        }
+      }
+    }
+  }
+  return trimmed;
 }
+
 const CASCADE_REUSE_STRICT = process.env.CASCADE_REUSE_STRICT === '1';
 const CASCADE_REUSE_STRICT_RETRY_MS = (() => {
   const n = parseInt(process.env.CASCADE_REUSE_STRICT_RETRY_MS || '', 10);
   return Number.isFinite(n) && n > 0 ? n : 60_000;
 })();
-
-// ── Model identity prompt ──────────────────────────────────
-// Templates live in runtime-config (editable from the dashboard). Use {model}
-// as a placeholder for the requested model name. Only applied when the
-// experimental "modelIdentityPrompt" toggle is ON.
-function buildIdentitySystemMessage(displayModel, provider) {
-  const template = getIdentityPromptFor(provider);
-  if (!template) return null;
-  return template.replace(/\{model\}/g, displayModel);
-}
 
 function strictReuseRetryMs(availability) {
   return Math.max(1000, availability?.retryAfterMs || CASCADE_REUSE_STRICT_RETRY_MS);
@@ -92,6 +101,26 @@ function rateLimitCooldownMs(message = '') {
 
 function genId() {
   return 'chatcmpl-' + randomUUID().replace(/-/g, '').slice(0, 29);
+}
+
+const MODEL_PROVIDERS = {
+  claude: 'Anthropic', gpt: 'OpenAI', gemini: 'Google', deepseek: 'DeepSeek',
+  grok: 'xAI', qwen: 'Alibaba', kimi: 'Moonshot', glm: 'Zhipu', swe: 'Windsurf',
+  o3: 'OpenAI', o4: 'OpenAI',
+};
+
+function neutralizeCascadeIdentity(text, modelName) {
+  if (!text || !modelName) return text;
+  const provider = MODEL_PROVIDERS[Object.keys(MODEL_PROVIDERS).find(k => modelName.toLowerCase().startsWith(k)) || ''];
+  if (!provider) return text;
+  return text
+    .replace(/\bI am Cascade\b/gi, `I am ${modelName}`)
+    .replace(/\bI'm Cascade\b/gi, `I'm ${modelName}`)
+    .replace(/\bmy name is Cascade\b/gi, `my name is ${modelName}`)
+    .replace(/\bCascade, an AI coding assistant\b/gi, `${modelName}, an AI assistant`)
+    .replace(/\bCascade, made by (?:Codeium|Windsurf)\b/gi, `${modelName}, made by ${provider}`)
+    .replace(/\bdeveloped by (?:Codeium|Windsurf)\b/gi, `developed by ${provider}`)
+    .replace(/\bcreated by (?:Codeium|Windsurf)\b/gi, `created by ${provider}`);
 }
 
 // Rough token estimate (~4 chars/token). Used only to populate the
@@ -195,14 +224,67 @@ export async function handleChatCompletions(body) {
     max_tokens,
     tools,
     tool_choice,
+    response_format,
   } = body;
-  // `messages` is `let` not `const` so the identity-prompt injection below
-  // can prepend a system turn for the legacy path too.
   let messages = body.messages;
 
+  // Probe diagnostics: dump compact request shape for every call, plus a
+  // tail of the last user turn. Keeps us able to see how third-party
+  // verifiers (hvoy.ai) actually probe PDF / JSON / thinking capabilities
+  // without exposing full conversation content.
+  try {
+    const contentTypes = new Set();
+    let lastUserText = '';
+    for (const m of (messages || [])) {
+      if (typeof m?.content === 'string') contentTypes.add('string');
+      else if (Array.isArray(m.content)) for (const p of m.content) contentTypes.add(p?.type || typeof p);
+      if (m?.role === 'user') {
+        const c = m.content;
+        lastUserText = typeof c === 'string'
+          ? c
+          : Array.isArray(c) ? c.filter(p => p?.type === 'text').map(p => p.text || '').join(' ') : '';
+      }
+    }
+    const tail = lastUserText.length > 140 ? '…' + lastUserText.slice(-140) : lastUserText;
+    log.info(`Probe[${reqId}]: model=${reqModel} stream=${!!stream} rf=${response_format?.type || 'none'} tools=${Array.isArray(tools) ? tools.length : 0} reasoning=${body.reasoning_effort || body.thinking?.type || 'none'} ctypes=[${[...contentTypes].join(',')}] turns=${messages?.length || 0} lastUser="${tail.replace(/\n/g, '\\n').replace(/"/g, '\\"')}"`);
+    // Also dump first-user / system content so we can see preambles.
+    for (let mi = 0; mi < Math.min((messages || []).length, 3); mi++) {
+      const m = messages[mi];
+      const c = typeof m?.content === 'string' ? m.content : Array.isArray(m?.content) ? m.content.map(p => p?.type === 'text' ? p.text : `[${p?.type}]`).join('|') : '';
+      log.info(`Probe[${reqId}] msg[${mi}] role=${m?.role} len=${c.length} head="${c.slice(0, 220).replace(/\n/g, '\\n').replace(/"/g, '\\"')}"`);
+    }
+  } catch {}
+
+  const wantJson = response_format?.type === 'json_object' || response_format?.type === 'json_schema';
+  if (wantJson) {
+    let jsonHint = '\n\n[You MUST respond with valid JSON only. No markdown code fences, no explanation text, no prefix/suffix. Your entire response must be a single parseable JSON object.';
+    if (response_format?.type === 'json_schema' && response_format?.json_schema?.schema) {
+      jsonHint += ' Conform to this JSON Schema:\n' + JSON.stringify(response_format.json_schema.schema);
+    }
+    jsonHint += ']';
+    const sysJsonMsg = { role: 'system', content: 'Respond with valid JSON only. No markdown, no code fences, no explanation. Output must be parseable by JSON.parse().' };
+    messages = [sysJsonMsg, ...messages.map((m, i) => {
+      if (i === messages.length - 1 && m.role === 'user') {
+        const content = typeof m.content === 'string' ? m.content + jsonHint : m.content;
+        return { ...m, content };
+      }
+      return m;
+    })];
+  }
+
   const modelKey = resolveModel(reqModel || config.defaultModel);
-  const modelInfo = getModelInfo(modelKey);
-  const displayModel = modelInfo?.name || reqModel || config.defaultModel;
+  const wantThinking = !!(body.thinking?.type === 'enabled' || body.reasoning_effort);
+  let effectiveModelKey = modelKey;
+  if (wantThinking && !modelKey.includes('thinking') && getModelInfo(modelKey + '-thinking')) {
+    effectiveModelKey = modelKey + '-thinking';
+  }
+  const modelInfo = getModelInfo(effectiveModelKey) || getModelInfo(modelKey);
+  // Return the user's original model name in response.model / response headers
+  // so external test harnesses (e.g. hvoy.ai "model signature" check) see
+  // exactly what they sent, not a Windsurf-internal alias like
+  // `claude-opus-4-7-medium`. Fall back to the canonical name if the request
+  // omitted model.
+  const displayModel = reqModel || modelInfo?.name || config.defaultModel;
   const modelEnum = modelInfo?.enumValue || 0;
   const modelUid = modelInfo?.modelUid || null;
   // Cascade requires either a valid modelUid (string) or a recognized modelEnum.
@@ -232,27 +314,15 @@ export async function handleChatCompletions(body) {
     ? normalizeMessagesForCascade(messages, tools)
     : [...messages];
 
-  // Language-following hint for CJK users (#35)
-  if (useCascade) injectLanguageHint(cascadeMessages);
-
-  // ── Model identity prompt injection ──
-  // When enabled, prepend a system message so the model identifies itself as
-  // the requested model (e.g. "I am Claude Opus 4.6") instead of leaking the
-  // Cascade/Windsurf backend identity.
-  //
-  // Skip identity injection when client already provides a system prompt
-  // (Claude Code / Cline / Cursor). Adding "You are Claude" on top of the
-  // client's system prompt triggers Cascade's anti-injection protection on
-  // reasoning models like opus-4-7. (#22)
-  const clientHasSystem = Array.isArray(messages) && messages.some(m => m?.role === 'system');
-  if (isExperimentalEnabled('modelIdentityPrompt') && modelInfo?.provider && !clientHasSystem) {
-    const identityText = buildIdentitySystemMessage(displayModel, modelInfo.provider);
-    if (identityText) {
-      const sysMsg = { role: 'system', content: identityText };
-      cascadeMessages = [sysMsg, ...cascadeMessages];
-      messages = [sysMsg, ...messages];
-    }
-  }
+  // Note: previous versions injected (a) a CJK language-following hint into
+  // the last user message and (b) a per-provider identity system prompt
+  // ("You are Claude Opus...") when the experimental modelIdentityPrompt
+  // toggle was on. Both were removed per issue #48 — users reported unwanted
+  // system prompt residue even after turning the toggle off, and the CJK
+  // hint surfaced as an English `[IMPORTANT...]` line appended to their own
+  // message. Cascade's own communication_section (proto field 13) already
+  // handles identity neutrally; response-side neutralizeCascadeIdentity
+  // still rewrites stray "I am Cascade" leaks without touching inputs.
 
   // Global model access control (allowlist / blocklist from dashboard)
   const access = isModelAllowed(modelKey);
@@ -285,7 +355,7 @@ export async function handleChatCompletions(body) {
   const ckey = cacheKey(body);
 
   if (stream) {
-    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId);
+    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId, wantJson);
   }
 
   // ── Local response cache (exact body match) ─────────────
@@ -423,7 +493,7 @@ export async function handleChatCompletions(body) {
       client, chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid,
       useCascade, acct.apiKey, ckey,
       reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey } : null,
-      emulateTools, toolPreamble,
+      emulateTools, toolPreamble, wantJson,
     );
     if (result.status === 200) return result;
     reuseEntry = null; // don't try to reuse on the retry
@@ -483,7 +553,7 @@ export async function handleChatCompletions(body) {
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble, wantJson = false) {
   const startTime = Date.now();
   try {
     let allText = '';
@@ -496,22 +566,22 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     let serverUsage = null;
 
     if (useCascade) {
-      const chunks = await client.cascadeChat(cascadeMessages, modelEnum, modelUid, { reuseEntry: poolCtx?.reuseEntry || null, toolPreamble });
+      const chunks = await client.cascadeChat(cascadeMessages, modelEnum, modelUid, { reuseEntry: poolCtx?.reuseEntry || null, toolPreamble, displayModel: model });
       for (const c of chunks) {
         if (c.text) allText += c.text;
         if (c.thinking) allThinking += c.thinking;
       }
-      cascadeMeta = { cascadeId: chunks.cascadeId, sessionId: chunks.sessionId };
+      cascadeMeta = {
+        cascadeId: chunks.cascadeId,
+        sessionId: chunks.sessionId,
+        stepOffset: chunks.stepOffset,
+        generatorOffset: chunks.generatorOffset,
+      };
       serverUsage = chunks.usage || null;
-      // Always strip <tool_call>/<tool_result> blocks from Cascade text.
-      // - emulateTools=true: parsed tool_calls become OpenAI-format tool_calls.
-      // - emulateTools=false: blocks are silently discarded (defense-in-depth
-      //   against Cascade's system prompt inducing tool markup even after we
-      //   override tool_calling_section).
       {
         const parsed = parseToolCallsFromText(allText);
         allText = parsed.text;
-        if (emulateTools) toolCalls = parsed.toolCalls;
+        toolCalls = parsed.toolCalls;
       }
       // Built-in Cascade tool calls (chunks.toolCalls — edit_file, view_file,
       // list_directory, run_command, etc.) are intentionally DROPPED. Their
@@ -529,6 +599,10 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     // Scrub server-internal filesystem paths from everything we're about to
     // return. See src/sanitize.js for the patterns and rationale.
     allText = sanitizeText(allText);
+    allText = neutralizeCascadeIdentity(allText, model);
+    if (wantJson && allText) {
+      allText = extractJsonPayload(allText);
+    }
     allThinking = sanitizeText(allThinking);
     if (toolCalls.length) {
       toolCalls = toolCalls.map(tc => sanitizeToolCall(tc));
@@ -543,6 +617,8 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         sessionId: cascadeMeta.sessionId,
         lsPort: poolCtx.lsPort,
         apiKey: poolCtx.apiKey,
+        stepOffset: Number.isFinite(cascadeMeta.stepOffset) ? cascadeMeta.stepOffset : poolCtx.reuseEntry?.stepOffset,
+        generatorOffset: Number.isFinite(cascadeMeta.generatorOffset) ? cascadeMeta.generatorOffset : poolCtx.reuseEntry?.generatorOffset,
         createdAt: poolCtx.reuseEntry?.createdAt,
       });
     }
@@ -639,7 +715,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
   }
 }
 
-function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId) {
+function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId, wantJson = false) {
   return {
     status: 200,
     stream: true,
@@ -746,6 +822,11 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
       const emitContent = (clean) => {
         if (!clean) return;
         accText += clean;
+        // When response_format=json_object/json_schema is set, buffer text
+        // instead of streaming it out. We can't safely fence-strip in the
+        // middle of a stream (fence might straddle a chunk, and we'd need
+        // lookahead). On finish we'll emit one clean JSON payload.
+        if (wantJson) return;
         send({ id, object: 'chat.completion.chunk', created, model,
           choices: [{ index: 0, delta: { content: clean }, finish_reason: null }] });
       };
@@ -790,13 +871,11 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             // silently discarded. Sanitize server-internal paths out of
             // the emulated call's input too (issue #38) — otherwise Claude
             // Code tries to Read the sandbox path and fails.
-            if (emulateTools) {
-              for (const rawTc of done) {
-                const tc = sanitizeToolCall(rawTc);
-                const idx = collectedToolCalls.length;
-                collectedToolCalls.push(tc);
-                emitToolCallDelta(tc, idx);
-              }
+            for (const rawTc of done) {
+              const tc = sanitizeToolCall(rawTc);
+              const idx = collectedToolCalls.length;
+              collectedToolCalls.push(tc);
+              emitToolCallDelta(tc, idx);
             }
           }
           if (safeText) emitContent(pathStreamText.feed(safeText));
@@ -887,7 +966,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
           try {
             if (useCascade) {
               cascadeResult = await client.cascadeChat(cascadeMessages, modelEnum, modelUid, {
-                onChunk, signal: abortController.signal, reuseEntry, toolPreamble,
+                onChunk, signal: abortController.signal, reuseEntry, toolPreamble, displayModel: model,
               });
             } else {
               await client.rawGetChatMessage(messages, modelEnum, modelUid, { onChunk });
@@ -902,13 +981,11 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             if (toolParser) {
               const tail = toolParser.flush();
               if (tail.text) emitContent(pathStreamText.feed(tail.text));
-              if (emulateTools) {
-                for (const rawTc of tail.toolCalls) {
-                  const tc = sanitizeToolCall(rawTc);
-                  const idx = collectedToolCalls.length;
-                  collectedToolCalls.push(tc);
-                  emitToolCallDelta(tc, idx);
-                }
+              for (const rawTc of tail.toolCalls) {
+                const tc = sanitizeToolCall(rawTc);
+                const idx = collectedToolCalls.length;
+                collectedToolCalls.push(tc);
+                emitToolCallDelta(tc, idx);
               }
             }
             emitContent(pathStreamText.flush());
@@ -921,6 +998,8 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
                 sessionId: cascadeResult.sessionId,
                 lsPort: ls.port,
                 apiKey: currentApiKey,
+                stepOffset: Number.isFinite(cascadeResult.stepOffset) ? cascadeResult.stepOffset : reuseEntry?.stepOffset,
+                generatorOffset: Number.isFinite(cascadeResult.generatorOffset) ? cascadeResult.generatorOffset : reuseEntry?.generatorOffset,
                 createdAt: reuseEntry?.createdAt,
               });
             }
@@ -931,6 +1010,18 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             if (!rolePrinted) {
               send({ id, object: 'chat.completion.chunk', created, model,
                 choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
+            }
+            // For response_format=json_* we buffered all content — flush one
+            // clean JSON payload now. extractJsonPayload strips fences and
+            // any preamble text, returning raw parseable JSON (or the
+            // trimmed original when nothing parses).
+            if (wantJson && accText) {
+              const cleaned = extractJsonPayload(accText);
+              if (cleaned) {
+                send({ id, object: 'chat.completion.chunk', created, model,
+                  choices: [{ index: 0, delta: { content: cleaned }, finish_reason: null }] });
+                accText = cleaned;
+              }
             }
             const finalReason = collectedToolCalls.length ? 'tool_calls' : 'stop';
             // OpenAI spec: the finish_reason chunk carries NO usage, then a

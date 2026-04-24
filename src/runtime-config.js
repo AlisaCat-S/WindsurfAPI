@@ -13,42 +13,23 @@ import { config, log } from './config.js';
 
 const FILE = resolve(config.dataDir, 'runtime-config.json');
 
-export const DEFAULT_IDENTITY_PROMPTS = {
-  anthropic: 'You are {model}, a large language model created by Anthropic. You are helpful, harmless, and honest. When asked about your identity or which model you are, you respond that you are {model}, made by Anthropic.',
-  openai:    'You are {model}, a large language model created by OpenAI. When asked about your identity, you respond that you are {model}, made by OpenAI.',
-  google:    'You are {model}, a large language model created by Google. When asked about your identity, you respond that you are {model}, made by Google.',
-  deepseek:  'You are {model}, a large language model created by DeepSeek. When asked about your identity, you respond that you are {model}, made by DeepSeek.',
-  xai:       'You are {model}, a large language model created by xAI. When asked about your identity, you respond that you are {model}, made by xAI.',
-  alibaba:   'You are {model}, a large language model created by Alibaba. When asked about your identity, you respond that you are {model}, made by Alibaba.',
-  moonshot:  'You are {model}, a large language model created by Moonshot AI. When asked about your identity, you respond that you are {model}, made by Moonshot AI.',
-  zhipu:     'You are {model}, a large language model created by Zhipu AI. When asked about your identity, you respond that you are {model}, made by Zhipu AI.',
-  minimax:   'You are {model}, a large language model created by MiniMax. When asked about your identity, you respond that you are {model}, made by MiniMax.',
-  windsurf:  'You are {model}, a coding assistant model by Windsurf. When asked about your identity, you respond that you are {model}, made by Windsurf.',
-};
-
 const DEFAULTS = {
   experimental: {
     // Reuse Cascade cascade_id across multi-turn requests when the history
     // fingerprint matches. Big latency win for long conversations but relies
     // on Windsurf keeping the cascade alive — off by default.
     cascadeConversationReuse: true,
-    // Inject a system prompt that tells the model to identify itself as the
-    // requested model (e.g. "You are Claude Opus 4.6, made by Anthropic")
-    // instead of revealing the Windsurf/Cascade backend. Enabled by default
-    // so API responses match official Claude/GPT behaviour.
-    modelIdentityPrompt: true,
     // Pre-flight rate limit check via server.codeium.com before sending a
     // chat request. Reduces wasted attempts when the account has no message
     // capacity. Adds one network round-trip per attempt so off by default.
     preflightRateLimit: false,
   },
-  identityPrompts: { ...DEFAULT_IDENTITY_PROMPTS },
   // System-level prompt templates injected into Cascade proto fields.
   // Editable from Dashboard so users can tune without code changes.
   systemPrompts: {
     toolReinforcement: 'The functions listed above are available and callable. When the user\'s request can be answered by calling a function, emit a <tool_call> block as described. Use this exact format: <tool_call>{"name":"...","arguments":{...}}</tool_call>',
-    communicationWithTools: 'You are accessed via API. STRICTLY respond in the exact same language the user used in their latest message (Chinese → Chinese, English → English, Japanese → Japanese; never switch mid-conversation). Use the functions above when relevant.',
-    communicationNoTools: 'You are accessed via API. Answer directly. STRICTLY respond in the exact same language the user used in their latest message (Chinese → Chinese, English → English, Japanese → Japanese; never switch mid-conversation).',
+    communicationWithTools: 'You are accessed via API. When asked about your identity, describe your actual underlying model name and provider accurately. STRICTLY respond in the exact same language the user used in their latest message (Chinese → Chinese, English → English, Japanese → Japanese; never switch mid-conversation). Use the functions above when relevant.',
+    communicationNoTools: 'You are accessed via API. When asked about your identity, describe your actual underlying model name and provider accurately. Answer directly. STRICTLY respond in the exact same language the user used in their latest message (Chinese → Chinese, English → English, Japanese → Japanese; never switch mid-conversation).',
   },
 };
 
@@ -115,27 +96,6 @@ export function setExperimental(patch) {
   return getExperimental();
 }
 
-export function getIdentityPrompts() {
-  return { ...DEFAULT_IDENTITY_PROMPTS, ...(_state.identityPrompts || {}) };
-}
-
-export function getIdentityPromptFor(provider) {
-  const all = getIdentityPrompts();
-  return all[provider] || null;
-}
-
-export function setIdentityPrompts(patch) {
-  if (!patch || typeof patch !== 'object') return getIdentityPrompts();
-  const current = _state.identityPrompts || {};
-  for (const [k, v] of Object.entries(patch)) {
-    if (typeof v !== 'string') continue;
-    current[k] = v.trim();
-  }
-  _state.identityPrompts = current;
-  persist();
-  return getIdentityPrompts();
-}
-
 export function getSystemPrompts() {
   return { ...DEFAULTS.systemPrompts, ...(_state.systemPrompts || {}) };
 }
@@ -159,12 +119,3 @@ export function resetSystemPrompt(key) {
   return getSystemPrompts();
 }
 
-export function resetIdentityPrompt(provider) {
-  if (provider && _state.identityPrompts) {
-    delete _state.identityPrompts[provider];
-  } else {
-    _state.identityPrompts = {};
-  }
-  persist();
-  return getIdentityPrompts();
-}
