@@ -271,19 +271,25 @@ export async function handleChatCompletions(body) {
   } = body;
   let messages = body.messages;
 
-  // Probe-mode diagnostics: when the incoming request has the shape of a
-  // third-party verification probe (response_format, tools with json, or
-  // any non-text content block), log a compact description so we can tell
-  // whether upstream tests are routing correctly.
+  // Probe diagnostics: dump compact request shape for every call, plus a
+  // tail of the last user turn. Keeps us able to see how third-party
+  // verifiers (hvoy.ai) actually probe PDF / JSON / thinking capabilities
+  // without exposing full conversation content.
   try {
-    const hasNonText = Array.isArray(messages) && messages.some(m => Array.isArray(m?.content) && m.content.some(p => p?.type && p.type !== 'text'));
-    if (response_format || hasNonText) {
-      const contentTypes = new Set();
-      for (const m of (messages || [])) {
-        if (Array.isArray(m.content)) for (const p of m.content) contentTypes.add(p?.type || typeof p);
+    const contentTypes = new Set();
+    let lastUserText = '';
+    for (const m of (messages || [])) {
+      if (typeof m?.content === 'string') contentTypes.add('string');
+      else if (Array.isArray(m.content)) for (const p of m.content) contentTypes.add(p?.type || typeof p);
+      if (m?.role === 'user') {
+        const c = m.content;
+        lastUserText = typeof c === 'string'
+          ? c
+          : Array.isArray(c) ? c.filter(p => p?.type === 'text').map(p => p.text || '').join(' ') : '';
       }
-      log.info(`Probe[${reqId}]: model=${reqModel} rf=${response_format?.type || 'none'} tools=${Array.isArray(tools) ? tools.length : 0} contentTypes=[${[...contentTypes].join(',')}] turns=${messages?.length || 0}`);
     }
+    const tail = lastUserText.length > 140 ? '…' + lastUserText.slice(-140) : lastUserText;
+    log.info(`Probe[${reqId}]: model=${reqModel} stream=${!!stream} rf=${response_format?.type || 'none'} tools=${Array.isArray(tools) ? tools.length : 0} reasoning=${body.reasoning_effort || body.thinking?.type || 'none'} ctypes=[${[...contentTypes].join(',')}] turns=${messages?.length || 0} lastUser="${tail.replace(/\n/g, '\\n').replace(/"/g, '\\"')}"`);
   } catch {}
 
   const wantJson = response_format?.type === 'json_object' || response_format?.type === 'json_schema';
