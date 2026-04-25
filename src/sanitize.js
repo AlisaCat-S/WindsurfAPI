@@ -31,16 +31,38 @@ const _repoRoot = (() => {
   } catch { return '/root/WindsurfAPI'; }
 })();
 
+// Placeholder is a single Unicode ellipsis (U+2026) — chosen because every
+// previous marker has been re-used by the model in some destructive way:
+//   ./tail                    → LLM Reads ./src/main.py → ENOENT → loops
+//   [internal]                → LLM runs `ls [internal]` → ENOENT → loops
+//   <redacted-path>           → LLM passes to Read/Bash → ENOENT (Linux) /
+//                               Errno 22 (Windows) → loops
+//   (internal path redacted)  → zsh parses `cd (internal path redacted)`
+//                               as glob-qualifier syntax → cryptic
+//                               "unknown file attribute: i" error
+//   redacted internal path    → Opus 4.7 echoes it verbatim into bash
+//                               commands; reads to the model as a
+//                               plausible directory name and the
+//                               failure mode is `cd: too many arguments`
+//                               which still wastes 2-3 turns
+// The ellipsis is the strongest fit for all four constraints at once:
+//   1. Single character, no shell metacharacter so no shell parses it
+//      specially (zsh `cd …` → ENOENT, clean recoverable error).
+//   2. Universally read by humans and LLMs as "content omitted" — there
+//      is essentially zero training data of `cd …` or `Read("…")` as a
+//      legitimate operation, so the model does not fall into the
+//      reuse-as-path loop the other markers triggered.
+//   3. UTF-8-safe (3 bytes) and survives cleanly through SSE, JSON,
+//      gRPC and shell quoting in every codepath we tested.
+//   4. Stays terse so it does not bloat sanitized prose.
+// Verified with the drift probe (scripts/_agent_drift_probe.py).
+const REDACTED_PATH = '…';
+
 const PATTERNS = [
-  [/\/tmp\/windsurf-workspace(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
-  // Cascade's sandbox workspace (per-account wsId). The model sees this path
-  // in its context because we AddTrackedWorkspace on it, then helpfully
-  // suggests it in tool calls — Claude Code then runs Read/Glob against
-  // a path that doesn't exist on the user's machine (issue #38). Rewrite
-  // to "." so the tool call falls back to cwd, which IS the user's project.
-  [/\/home\/user\/projects\/workspace-[a-z0-9]+(\/[^\s"'`<>)}\],*;]*)?/g, '.$1'],
-  [/\/opt\/windsurf(?:\/[^\s"'`<>)}\],*;]*)?/g, '[internal]'],
-  [new RegExp(_repoRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:\\/[^\\s"\'`<>)}\\],*;]*)?', 'g'), '[internal]'],
+  [/\/tmp\/windsurf-workspace(?:\/[^\s"'`<>)}\],*;]*)?/g, REDACTED_PATH],
+  [/\/home\/user\/projects\/workspace-[a-z0-9]+(?:\/[^\s"'`<>)}\],*;]*)?/g, REDACTED_PATH],
+  [/\/opt\/windsurf(?:\/[^\s"'`<>)}\],*;]*)?/g, REDACTED_PATH],
+  [new RegExp(_repoRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '(?:\\/[^\\s"\'`<>)}\\],*;]*)?', 'g'), REDACTED_PATH],
 ];
 
 // Bare literals (no path tail) used by the streaming cut-point finder.
