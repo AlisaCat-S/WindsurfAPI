@@ -23,6 +23,30 @@ import { MODELS, MODEL_TIER_ACCESS as _TIER_TABLE, getTierModels as _getTierMode
 import { windsurfLogin, refreshFirebaseToken, reRegisterWithCodeium } from './windsurf-login.js';
 import { getModelAccessConfig, setModelAccessMode, setModelAccessList, addModelToList, removeModelFromList } from './model-access.js';
 import { checkMessageRateLimit } from '../windsurf-api.js';
+import { assertPublicUrlHost } from '../image.js';
+
+function maskApiKey(key = '') {
+  const s = String(key || '');
+  if (s.length <= 12) return s ? `${s.slice(0, 4)}***` : '';
+  return `${s.slice(0, 8)}***${s.slice(-4)}`;
+}
+
+export function buildBatchProxyBinding(result, proxy) {
+  const accountId = result?.account?.id || null;
+  if (!result?.success || !proxy || !accountId) return null;
+  const proxyParts = String(proxy).match(/^(?:(\w+):\/\/)?(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$/);
+  if (!proxyParts) return null;
+  return {
+    accountId,
+    proxy: {
+      type: proxyParts[1] || 'http',
+      host: proxyParts[4],
+      port: parseInt(proxyParts[5]),
+      username: proxyParts[2] || '',
+      password: proxyParts[3] || '',
+    },
+  };
+}
 
 function json(res, status, body) {
   const data = JSON.stringify(body);
@@ -36,15 +60,11 @@ function json(res, status, body) {
 }
 
 function checkAuth(req) {
-  // Header is preferred (set by fetch). EventSource can't set custom headers,
-  // so /logs/stream etc. also accept ?pwd=... as fallback.
-  let pw = req.headers['x-dashboard-password'] || '';
-  if (!pw) {
-    try {
-      const qs = new URL(req.url, 'http://x').searchParams;
-      pw = qs.get('pwd') || '';
-    } catch {}
-  }
+  // Header-only auth. logs/stream switched from EventSource to fetch +
+  // ReadableStream months ago, so the EventSource exception is gone and
+  // ?pwd= query passwords would only leak into URL access logs and
+  // browser history without any callers needing them.
+  const pw = req.headers['x-dashboard-password'] || '';
   if (config.dashboardPassword) return pw === config.dashboardPassword;
   if (config.apiKey) return pw === config.apiKey;
   return true;
@@ -81,7 +101,7 @@ async function processWindsurfLogin({ email, password, loginProxy, autoAdd }) {
 
   return {
     success: true,
-    apiKey: result.apiKey,
+    apiKey_masked: maskApiKey(result.apiKey),
     name: result.name,
     email: result.email,
     apiServerUrl: result.apiServerUrl,
@@ -570,19 +590,11 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
         try {
           const loginProxy = proxy ? { host: proxy } : getProxyConfig().global;
           const result = await processWindsurfLogin({ email, password, loginProxy, autoAdd });
-          if (result.success && proxy && result.accountId) {
-            const proxyParts = proxy.match(/^(?:(\w+):\/\/)?(?:([^:]+):([^@]+)@)?([^:]+):(\d+)$/);
-            if (proxyParts) {
-              setAccountProxy(result.accountId, {
-                type: proxyParts[1] || 'http',
-                host: proxyParts[4],
-                port: parseInt(proxyParts[5]),
-                username: proxyParts[2] || '',
-                password: proxyParts[3] || '',
-              });
+          const binding = buildBatchProxyBinding(result, proxy);
+          if (binding) {
+              setAccountProxy(binding.accountId, binding.proxy);
               result.proxy = proxy;
-              ensureLsForAccount(result.accountId).catch(() => {});
-            }
+              ensureLsForAccount(binding.accountId).catch(() => {});
           }
           results.push(result);
         } catch (err) {
@@ -619,7 +631,7 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
 
       return json(res, 200, {
         success: true,
-        apiKey,
+        apiKey_masked: maskApiKey(apiKey),
         name,
         email: email || '',
         account: account ? { id: account.id, email: account.email, status: account.status } : null,
@@ -643,6 +655,13 @@ export async function handleDashboardApi(method, subpath, body, req, res) {
     } catch (err) {
       return json(res, 500, { error: err.message });
     }
+  }
+
+  const revealKey = subpath.match(/^\/account\/([^/]+)\/reveal-key$/);
+  if (revealKey && method === 'POST') {
+    const acct = getAccountList().find(a => a.id === revealKey[1]);
+    if (!acct) return json(res, 404, { error: 'Account not found' });
+    return json(res, 200, { success: true, apiKey: acct.apiKey });
   }
 
   // ─── Firebase Token Refresh ───────────────────────────────
@@ -713,10 +732,8 @@ async function gitStatus() {
   };
 }
 
-const PRIVATE_PROXY_HOST = /^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|0\.|localhost$|0\.0\.0\.0$)/i;
-
 async function testProxy({ host, port, username, password, type }) {
-  if (PRIVATE_PROXY_HOST.test(host)) throw new Error('ERR_PROXY_PRIVATE_IP');
+  await assertPublicUrlHost(host);
   const { isSocks, createSocksTunnel } = await import('../socks.js');
   const tls = await import('node:tls');
   const targetHost = 'api.ipify.org';

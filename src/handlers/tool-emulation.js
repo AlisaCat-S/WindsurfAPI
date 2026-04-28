@@ -65,7 +65,11 @@ export function buildToolPreamble(tools) {
   // "User-message-level fallback preamble" comment block at the top of
   // this module for the injection-shape rationale. Full schemas live
   // in the proto-level tool_calling_section override.
-  return `Tools available this turn: ${names.join(', ')}. To call one, emit a single-line block: <tool_call>{"name":"...","arguments":{...}}</tool_call>. Otherwise answer directly in plain text. After the last <tool_call>, stop generating; the caller returns results in the next turn as <tool_result tool_call_id="...">...</tool_result>.`;
+  const hints = [];
+  const lowerNames = new Set(names.map(n => n.toLowerCase()));
+  if (lowerNames.has('bash')) hints.push('For Bash, put the complete shell command in arguments.command.');
+  if (lowerNames.has('read')) hints.push('For Read, put the exact path in arguments.file_path.');
+  return `Tools available this turn: ${names.join(', ')}. To call one, emit a single-line block: <tool_call>{"name":"...","arguments":{...}}</tool_call>. ${hints.join(' ')} Otherwise answer directly in plain text. After the last <tool_call>, stop generating; the caller returns results in the next turn as <tool_result tool_call_id="...">...</tool_result>.`;
 }
 
 /**
@@ -101,6 +105,28 @@ const TOOL_CHOICE_SUFFIX = {
 6. Do NOT call any functions. Answer the user's question directly in plain text.`,
 };
 
+function lowerToolName(t) {
+  return String(t?.function?.name || '').trim().toLowerCase();
+}
+
+function toolSpecificRules(tools) {
+  const names = new Set((tools || []).map(lowerToolName).filter(Boolean));
+  const lines = [];
+  if (names.has('bash')) {
+    lines.push('- Bash: arguments MUST include the full command string in the "command" field. Preserve quotes, flags, pipes, redirections, and shell operators exactly as requested. Do not shorten, reinterpret, split, or ask for the command again when it was already provided.');
+  }
+  if (names.has('read')) {
+    lines.push('- Read: use "file_path" exactly for the path argument. If the user gives a concrete path, copy that path exactly instead of substituting a workspace guess.');
+  }
+  if (names.has('write')) {
+    lines.push('- Write: use "file_path" for the target path and "content" for bytes to write. Do not replace requested content with a summary or placeholder.');
+  }
+  if (names.has('edit') || names.has('multiedit')) {
+    lines.push('- Edit/MultiEdit: preserve old_string/new_string text exactly, including whitespace and quotes. Do not paraphrase file edits.');
+  }
+  return lines;
+}
+
 /**
  * Resolve the OpenAI tool_choice parameter into a { mode, forceName } pair.
  *   tool_choice = "auto" | "required" | "none"
@@ -135,12 +161,10 @@ export function buildToolPreambleForProto(tools, toolChoice, environment) {
 
   const lines = [];
   if (environment && typeof environment === 'string' && environment.trim()) {
-    lines.push('## Authoritative environment for this session');
-    lines.push('The facts below are provided by the calling agent and describe the REAL execution context. Tool calls MUST operate on these paths. Ignore any workspace path you may have inferred from earlier instructions or training priors.');
+    lines.push('## Environment facts');
+    lines.push('The facts below are provided by the calling agent and describe the active execution context. Tool calls operate on these paths.');
     lines.push('');
     lines.push(environment.trim());
-    lines.push('');
-    lines.push('---');
     lines.push('');
   }
   lines.push(TOOL_PROTOCOL_SYSTEM_HEADER);
@@ -148,6 +172,12 @@ export function buildToolPreambleForProto(tools, toolChoice, environment) {
   lines.push(TOOL_CHOICE_SUFFIX[mode] || TOOL_CHOICE_SUFFIX.auto);
   if (forceName) {
     lines.push(`7. You MUST call the function "${forceName}". No other function and no direct answer.`);
+  }
+  const specificRules = toolSpecificRules(tools);
+  if (specificRules.length) {
+    lines.push('');
+    lines.push('Tool argument fidelity rules:');
+    lines.push(...specificRules);
   }
   lines.push('');
   lines.push('Available functions:');
@@ -164,6 +194,53 @@ export function buildToolPreambleForProto(tools, toolChoice, environment) {
       lines.push('```');
     }
   }
+  return lines.join('\n');
+}
+
+/**
+ * Compact, names-only proto preamble. Same protocol header + environment
+ * block as `buildToolPreambleForProto`, but lists tools by name only and
+ * drops every parameter schema. Used as a payload-budget fallback when a
+ * caller (e.g. Claude Code with 30+ tools) would otherwise blow past the
+ * upstream LS panel-state ceiling — see chat.js TOOL_PREAMBLE_MAX_BYTES.
+ *
+ * The model loses parameter-shape detail in this mode, so it must rely on
+ * the tool names matching the calling agent's contract. Acceptable trade
+ * because the alternative is the request failing with panel_state_missing
+ * retries until the proxy gives up.
+ */
+export function buildCompactToolPreambleForProto(tools, toolChoice, environment) {
+  if (!Array.isArray(tools) || tools.length === 0) return '';
+  const { mode, forceName } = resolveToolChoice(toolChoice);
+  const names = [];
+  for (const t of tools) {
+    if (t?.type !== 'function' || !t.function?.name) continue;
+    names.push(t.function.name);
+  }
+  if (!names.length) return '';
+
+  const lines = [];
+  if (environment && typeof environment === 'string' && environment.trim()) {
+    lines.push('## Environment facts');
+    lines.push('The facts below are provided by the calling agent and describe the active execution context. Tool calls operate on these paths.');
+    lines.push('');
+    lines.push(environment.trim());
+    lines.push('');
+  }
+  lines.push(TOOL_PROTOCOL_SYSTEM_HEADER);
+  lines.push(TOOL_CHOICE_SUFFIX[mode] || TOOL_CHOICE_SUFFIX.auto);
+  if (forceName) {
+    lines.push(`7. You MUST call the function "${forceName}". No other function and no direct answer.`);
+  }
+  const specificRules = toolSpecificRules(tools);
+  if (specificRules.length) {
+    lines.push('');
+    lines.push('Tool argument fidelity rules:');
+    lines.push(...specificRules);
+  }
+  lines.push('');
+  lines.push(`Available functions: ${names.join(', ')}.`);
+  lines.push('Parameter schemas are omitted in this preamble due to total tool-list size. Match each <tool_call> to the function name; the calling agent will validate argument shapes when it executes the call.');
   return lines.join('\n');
 }
 
@@ -208,8 +285,26 @@ function safeParseJson(s) {
  * - Rewrites assistant messages that carry tool_calls so the model sees its
  *   own prior emissions in the canonical <tool_call> format
  */
-export function normalizeMessagesForCascade(messages, tools) {
+function contentTextForPreambleCheck(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return JSON.stringify(content ?? '');
+  return content
+    .filter(p => typeof p?.text === 'string')
+    .map(p => p.text)
+    .join('');
+}
+
+function prependPreambleToContent(content, preamble) {
+  if (Array.isArray(content)) {
+    return [{ type: 'text', text: `${preamble}\n\n` }, ...content];
+  }
+  const cur = typeof content === 'string' ? content : JSON.stringify(content ?? '');
+  return `${preamble}\n\n${cur}`;
+}
+
+export function normalizeMessagesForCascade(messages, tools, options = {}) {
   if (!Array.isArray(messages)) return messages;
+  const injectUserPreamble = options.injectUserPreamble !== false;
   const out = [];
 
   for (const m of messages) {
@@ -259,16 +354,16 @@ export function normalizeMessagesForCascade(messages, tools) {
   // preamble on tool_result turns lets Opus stay in tool-using mode for
   // the full conversation, matching native-Anthropic-API behaviour.
   const preamble = buildToolPreamble(tools);
-  if (preamble) {
+  if (preamble && injectUserPreamble) {
     for (let i = out.length - 1; i >= 0; i--) {
       if (out[i].role !== 'user') continue;
-      const cur = typeof out[i].content === 'string' ? out[i].content : JSON.stringify(out[i].content ?? '');
+      const cur = contentTextForPreambleCheck(out[i].content);
       // Skip synthetic tool_result-only turns; they are not a place to
       // re-introduce tools. (A user turn that happens to MENTION the
       // marker but also has real text is fine — only pure tool_result
       // wrappers are skipped.)
       if (/^\s*<tool_result\b/.test(cur)) break;
-      out[i] = { ...out[i], content: preamble + '\n\n' + cur };
+      out[i] = { ...out[i], content: prependPreambleToContent(out[i].content, preamble) };
       break;
     }
   }
@@ -316,10 +411,10 @@ export class ToolCallStreamParser {
     return -1;
   }
 
-  _consumeJsonBlock(parseFn, doneCalls, safeParts) {
+  _consumeJsonBlock(parseFn, pushTool, pushText) {
     if (this.buffer.length > 65_536) {
       log.warn(`ToolCallStreamParser: JSON block exceeds 65KB (${this.buffer.length} bytes), emitting as text`);
-      safeParts.push(this.buffer);
+      pushText(this.buffer);
       this.buffer = '';
       return true;
     }
@@ -329,10 +424,9 @@ export class ToolCallStreamParser {
     this.buffer = this.buffer.slice(endIdx + 1);
     const tc = parseFn(jsonStr);
     if (tc) {
-      doneCalls.push(tc);
-      this._totalSeen++;
+      pushTool(tc);
     } else {
-      safeParts.push(jsonStr);
+      pushText(jsonStr);
     }
     return true;
   }
@@ -369,10 +463,22 @@ export class ToolCallStreamParser {
   }
 
   feed(delta) {
-    if (!delta) return { text: '', toolCalls: [] };
+    if (!delta) return { text: '', toolCalls: [], items: [] };
     this.buffer += delta;
     const safeParts = [];
     const doneCalls = [];
+    const items = [];
+    const pushText = (text) => {
+      if (!text) return;
+      safeParts.push(text);
+      items.push({ type: 'text', text });
+    };
+    const pushTool = (toolCall) => {
+      if (!toolCall) return;
+      doneCalls.push(toolCall);
+      items.push({ type: 'tool_call', toolCall });
+      this._totalSeen++;
+    };
     const TC_OPEN = '<tool_call>';
     const TC_CLOSE = '</tool_call>';
     const TR_PREFIX = '<tool_result';
@@ -403,28 +509,27 @@ export class ToolCallStreamParser {
           const args = parsed.arguments;
           const argsJson = typeof args === 'string' ? args : JSON.stringify(args ?? {});
           log.debug(`ToolParser: matched xml format, name=${parsed.name}`);
-          doneCalls.push({
+          pushTool({
             id: `call_${this._totalSeen}_${Date.now().toString(36)}`,
             name: parsed.name,
             argumentsJson: argsJson,
           });
-          this._totalSeen++;
         } else {
-          safeParts.push(`<tool_call>${body}</tool_call>`);
+          pushText(`<tool_call>${body}</tool_call>`);
         }
         continue;
       }
 
       // ── Inside a {"tool_code": "…"} block ──
       if (this.inToolCode) {
-        if (!this._consumeJsonBlock(s => this._parseToolCodeJson(s), doneCalls, safeParts)) break;
+        if (!this._consumeJsonBlock(s => this._parseToolCodeJson(s), pushTool, pushText)) break;
         this.inToolCode = false;
         continue;
       }
 
       // ── Inside a bare {"name":"…","arguments":{…}} block ──
       if (this.inBareCall) {
-        if (!this._consumeJsonBlock(s => this._parseBareToolCallJson(s), doneCalls, safeParts)) break;
+        if (!this._consumeJsonBlock(s => this._parseBareToolCallJson(s), pushTool, pushText)) break;
         this.inBareCall = false;
         continue;
       }
@@ -461,12 +566,12 @@ export class ToolCallStreamParser {
           }
         }
         const emitUpto = this.buffer.length - holdLen;
-        if (emitUpto > 0) safeParts.push(this.buffer.slice(0, emitUpto));
+        if (emitUpto > 0) pushText(this.buffer.slice(0, emitUpto));
         this.buffer = this.buffer.slice(emitUpto);
         break;
       }
 
-      if (nextIdx > 0) safeParts.push(this.buffer.slice(0, nextIdx));
+      if (nextIdx > 0) pushText(this.buffer.slice(0, nextIdx));
 
       if (tagType === 'tc') {
         this.buffer = this.buffer.slice(nextIdx + TC_OPEN.length);
@@ -488,7 +593,7 @@ export class ToolCallStreamParser {
       }
     }
 
-    return { text: safeParts.join(''), toolCalls: doneCalls };
+    return { text: safeParts.join(''), toolCalls: doneCalls, items };
   }
 
   flush() {

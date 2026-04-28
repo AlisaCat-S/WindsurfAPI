@@ -34,7 +34,7 @@ const POOL_MAX = 500;
 
 // fingerprint -> {
 //   cascadeId, sessionId, lsPort, apiKey,
-//   stepOffset, generatorOffset,
+//   callerKey, stepOffset, generatorOffset,
 //   createdAt, lastAccess
 // }
 const _pool = new Map();
@@ -66,8 +66,9 @@ const META_TAG_NAMES = new Set([
 ]);
 
 function buildMetaTagRe() {
+  const escaped = [...META_TAG_NAMES].map(t => t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
   return new RegExp(
-    `<(${[...META_TAG_NAMES].join('|')})[^>]*>[\\s\\S]*?</\\1>`,
+    `<(${escaped.join('|')})[^>]*>[\\s\\S]*?</\\1>`,
     'g'
   );
 }
@@ -93,6 +94,19 @@ function stripMetaTags(s) {
   return stripped;
 }
 
+function canonicalContentBlock(part) {
+  if (typeof part?.text === 'string') return part.text;
+  const type = String(part?.type || '').toLowerCase();
+  if (type === 'image' || type === 'image_url' || type === 'input_image'
+    || type === 'document' || type === 'file' || type === 'input_file'
+    || part?.source?.type === 'base64' || part?.image_url) {
+    return `[${type || 'binary'} omitted]`;
+  }
+  const raw = JSON.stringify(part ?? '');
+  if (/"data"\s*:\s*"[A-Za-z0-9+/=]{128,}"/.test(raw)) return '[binary omitted]';
+  return raw;
+}
+
 /**
  * Canonicalise a message list for hashing. Strips anything that could drift
  * between turns (id, name, tool metadata, client meta-tags) and normalises
@@ -102,7 +116,7 @@ function canonicalise(messages) {
   return messages.map(m => {
     let raw;
     if (typeof m.content === 'string') raw = m.content;
-    else if (Array.isArray(m.content)) raw = m.content.map(p => (typeof p?.text === 'string' ? p.text : JSON.stringify(p))).join('');
+    else if (Array.isArray(m.content)) raw = m.content.map(p => canonicalContentBlock(p)).join('');
     else raw = JSON.stringify(m.content ?? '');
     return { role: m.role, content: stripMetaTags(raw) };
   });
@@ -134,22 +148,27 @@ function stableTurns(messages) {
       : m);
 }
 
-export function fingerprintBefore(messages, modelKey = '') {
+export function fingerprintBefore(messages, modelKey = '', callerKey = '') {
   if (!Array.isArray(messages) || messages.length < 2) return null;
   const turns = stableTurns(messages);
   if (turns.length < 2) return null;
-  return sha256(modelKey + '\0' + systemPrefix(messages) + '\0' + JSON.stringify(canonicalise(turns.slice(0, -1))));
+  return sha256(String(callerKey || '') + '\0' + modelKey + '\0' + systemPrefix(messages) + '\0' + JSON.stringify(canonicalise(turns.slice(0, -1))));
 }
 
-export function fingerprintAfter(messages, modelKey = '') {
+export function fingerprintAfter(messages, modelKey = '', callerKey = '') {
   const turns = stableTurns(messages);
   if (!turns.length) return null;
-  return sha256(modelKey + '\0' + systemPrefix(messages) + '\0' + JSON.stringify(canonicalise(turns)));
+  return sha256(String(callerKey || '') + '\0' + modelKey + '\0' + systemPrefix(messages) + '\0' + JSON.stringify(canonicalise(turns)));
+}
+
+function effectiveTtl(entry) {
+  const hint = Number(entry?.ttlHintMs);
+  return Number.isFinite(hint) && hint > 0 ? hint : POOL_TTL_MS;
 }
 
 function prune(now) {
   for (const [fp, e] of _pool) {
-    if (now - e.lastAccess > POOL_TTL_MS) { _pool.delete(fp); stats.expired++; }
+    if (now - e.lastAccess > effectiveTtl(e)) { _pool.delete(fp); stats.expired++; }
   }
   if (_pool.size <= POOL_MAX) return;
   const entries = [..._pool.entries()].sort((a, b) => a[1].lastAccess - b[1].lastAccess);
@@ -167,12 +186,16 @@ function prune(now) {
  * fingerprint on success (or just drop it on failure and a fresh cascade
  * will be created next turn).
  */
-export function checkout(fingerprint) {
+export function checkout(fingerprint, callerKey = '') {
   if (!fingerprint) { stats.misses++; return null; }
   const entry = _pool.get(fingerprint);
   if (!entry) { stats.misses++; return null; }
   _pool.delete(fingerprint);
-  if (Date.now() - entry.lastAccess > POOL_TTL_MS) {
+  if (entry.callerKey && callerKey && entry.callerKey !== callerKey) {
+    stats.misses++;
+    return null;
+  }
+  if (Date.now() - entry.lastAccess > effectiveTtl(entry)) {
     stats.expired++;
     stats.misses++;
     return null;
@@ -183,19 +206,32 @@ export function checkout(fingerprint) {
 
 /**
  * Store (or restore) a conversation entry under a new fingerprint.
+ *
+ * `ttlHintMs` (optional) extends this entry's expiry past the pool's
+ * default 30 min — used to honour Anthropic prompt-caching markers that
+ * request a 1h ttl. Pass `undefined` (default) to keep the existing
+ * entry-level hint when restoring across turns.
  */
-export function checkin(fingerprint, entry) {
+export function checkin(fingerprint, entry, callerKey = '', ttlHintMs) {
   if (!fingerprint || !entry) return;
   const now = Date.now();
+  // When the caller didn't pass an explicit hint, preserve any hint
+  // that was already on the source entry — restoring after a successful
+  // turn shouldn't silently shorten the TTL the original request asked for.
+  const resolvedHint = ttlHintMs !== undefined
+    ? ttlHintMs
+    : entry.ttlHintMs;
   _pool.set(fingerprint, {
     cascadeId: entry.cascadeId,
     sessionId: entry.sessionId,
     lsPort: entry.lsPort,
     apiKey: entry.apiKey,
+    callerKey: callerKey || entry.callerKey || '',
     stepOffset: Number.isFinite(entry.stepOffset) ? entry.stepOffset : 0,
     generatorOffset: Number.isFinite(entry.generatorOffset) ? entry.generatorOffset : 0,
     createdAt: entry.createdAt || now,
     lastAccess: now,
+    ...(Number.isFinite(resolvedHint) && resolvedHint > 0 ? { ttlHintMs: resolvedHint } : {}),
   });
   stats.stores++;
   prune(now);

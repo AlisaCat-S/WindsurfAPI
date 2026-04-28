@@ -3,9 +3,9 @@
  * Routes to RawGetChatMessage (legacy) or Cascade (premium) based on model type.
  */
 
-import { randomUUID } from 'crypto';
-import { WindsurfClient } from '../client.js';
-import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited } from '../auth.js';
+import { createHash, randomUUID } from 'crypto';
+import { WindsurfClient, contentToString, isCascadeTransportError } from '../client.js';
+import { getApiKey, acquireAccountByKey, releaseAccount, getAccountAvailability, reportError, reportSuccess, markRateLimited, reportInternalError, updateCapability, getAccountList, isAllRateLimited, isAllTemporarilyUnavailable, refundReservation } from '../auth.js';
 import { resolveModel, getModelInfo } from '../models.js';
 import { getLsFor, ensureLs } from '../langserver.js';
 import { config, log } from '../config.js';
@@ -20,13 +20,65 @@ import {
 } from '../conversation-pool.js';
 import {
   normalizeMessagesForCascade, ToolCallStreamParser, parseToolCallsFromText,
-  buildToolPreambleForProto,
+  buildToolPreambleForProto, buildCompactToolPreambleForProto,
 } from './tool-emulation.js';
 import { sanitizeText, sanitizeToolCall, PathSanitizeStream } from '../sanitize.js';
+import { registerSseController } from '../sse-registry.js';
 
 const HEARTBEAT_MS = 15_000;
 const QUEUE_RETRY_MS = 1_000;
 const QUEUE_MAX_WAIT_MS = 30_000;
+
+// Cap exponential backoff before falling over to the next account when
+// upstream Cascade returns "internal error occurred". Without this a
+// 9-account pool hammers the upstream within ~10s and every attempt
+// sees the same transient — the OpenClaw real-scenario probe (#28)
+// caught this as 11/20 failures even though the proxy itself is
+// healthy. With backoff capped at 5s the Nth attempt sees a cooler
+// upstream and has a meaningful chance of succeeding.
+//   retry 0 → 500ms, 1 → 1s, 2 → 2s, 3 → 4s, ≥4 → 5s
+async function internalErrorBackoff(retryIdx) {
+  const ms = Math.min(500 * Math.pow(2, retryIdx), 5000);
+  await new Promise(r => setTimeout(r, ms));
+  return ms;
+}
+
+function upstreamTransientErrorMessage(model, triedCount, reason = 'internal_error') {
+  const detail = reason === 'cascade_transport'
+    ? 'Cascade/语言服务器 HTTP/2 流被取消'
+    : 'internal_error';
+  return `${model} 上游 Windsurf Cascade 服务瞬态故障：已在 ${triedCount} 个账号上重试都收到 ${detail}。这是上游或本地语言服务器会话的瞬时问题，建议 30-60 秒后重试；若连续出现，请重启语言服务器。`;
+}
+
+export function isUpstreamTransientError(err, isInternal = false) {
+  return !!err && (isInternal || err.kind === 'transient_stall' || isCascadeTransportError(err));
+}
+
+function shortHash(text) {
+  return createHash('sha256').update(String(text || '')).digest('hex').slice(0, 16);
+}
+
+export function redactRequestLogText(text) {
+  return String(text || '')
+    .replace(/sk-[A-Za-z0-9_-]{20,}/g, 'sk-***')
+    .replace(/(?:ant-api\d{2}|sk-ant-api\d{2})-[A-Za-z0-9_-]{20,}/g, 'sk-ant-***')
+    .replace(/\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, 'jwt-***')
+    .replace(/\bAKIA[0-9A-Z]{16}\b/g, 'AKIA***')
+    .replace(/\b(cookie|set-cookie)\s*:\s*[^\n\r]+/gi, '$1: ***')
+    .replace(/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi, '***@***');
+}
+
+function requestLogSummary(text, limit = 220) {
+  const raw = String(text || '');
+  if (process.env.DEBUG_REQUEST_BODIES === '1') {
+    return `head="${redactRequestLogText(raw.slice(0, limit)).replace(/\n/g, '\\n').replace(/"/g, '\\"')}"`;
+  }
+  return `len=${raw.length} hash=${shortHash(raw)}`;
+}
+
+export function chatStreamError(message, type = 'upstream_error', code = null) {
+  return { error: { message: sanitizeText(message || 'Upstream stream error'), type, code } };
+}
 
 /**
  * Extract a clean JSON payload from a model response. Handles three common
@@ -80,19 +132,241 @@ function extractJsonPayload(text) {
   return trimmed;
 }
 
+function textFromMessageContent(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(p => typeof p?.text === 'string')
+      .map(p => p.text)
+      .join('\n');
+  }
+  return '';
+}
+
+export function extractRequestedJsonKeys(messages) {
+  if (!Array.isArray(messages)) return [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== 'user') continue;
+    const text = textFromMessageContent(m.content).split('\n\n[You MUST respond with valid JSON only.')[0];
+    if (!text || /^\s*<tool_result\b/i.test(text)) continue;
+    const match = text.match(/\b(?:exact\s+)?keys\s+([A-Za-z_$][\w$-]*(?:\s*,\s*[A-Za-z_$][\w$-]*)*(?:\s+(?:and|&)\s+(?!no\b)[A-Za-z_$][\w$-]*)?)/i);
+    if (!match) continue;
+    return match[1]
+      .replace(/\s+(?:and|&)\s+/gi, ',')
+      .split(',')
+      .map(s => s.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
+export function isExplicitJsonRequested(messages) {
+  if (!Array.isArray(messages)) return false;
+  for (const m of messages) {
+    if (m?.role !== 'user') continue;
+    const text = textFromMessageContent(m.content);
+    if (!text || /^\s*<tool_result\b/i.test(text)) continue;
+    if (/\b(?:compact\s+)?JSON\b/i.test(text) && /\b(?:answer|respond|return|output|containing|with|only|valid)\b/i.test(text)) {
+      return true;
+    }
+    if (/\bJSON\s+(?:object|only|format)\b/i.test(text)) return true;
+    if (/\b(?:answer|respond|return|output)\s+only\s+(?:with\s+)?(?:valid\s+)?JSON\b/i.test(text)) return true;
+  }
+  return false;
+}
+
+function appendJsonHintToContent(content, hint) {
+  if (typeof content === 'string') return content + hint;
+  if (Array.isArray(content)) return [...content, { type: 'text', text: hint }];
+  return content;
+}
+
+function plainObject(v) {
+  return v && typeof v === 'object' && !Array.isArray(v);
+}
+
+function findDeepValue(obj, wanted) {
+  if (!plainObject(obj) && !Array.isArray(obj)) return undefined;
+  const wantedLower = wanted.toLowerCase();
+  const stack = [obj];
+  while (stack.length) {
+    const cur = stack.shift();
+    if (plainObject(cur)) {
+      for (const [k, v] of Object.entries(cur)) {
+        if (k.toLowerCase() === wantedLower) return v;
+        if (plainObject(v) || Array.isArray(v)) stack.push(v);
+      }
+    } else if (Array.isArray(cur)) {
+      for (const v of cur) {
+        if (plainObject(v) || Array.isArray(v)) stack.push(v);
+      }
+    }
+  }
+  return undefined;
+}
+
+function safeJsonParse(text) {
+  try { return JSON.parse(text); } catch { return undefined; }
+}
+
+function collectToolFacts(messages) {
+  const namesById = new Map();
+  const facts = { byTool: {}, all: [] };
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (m?.role === 'assistant' && Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) namesById.set(tc.id, tc.function?.name || '');
+    }
+    if (m?.role !== 'tool') continue;
+    const toolName = namesById.get(m.tool_call_id) || 'tool';
+    const key = toolName.toLowerCase();
+    const content = typeof m.content === 'string' ? m.content.trim() : JSON.stringify(m.content ?? '');
+    const parsed = safeJsonParse(extractJsonPayload(content));
+    const fact = { toolName, content, parsed };
+    facts.all.push(fact);
+    if (!facts.byTool[key]) facts.byTool[key] = [];
+    facts.byTool[key].push(fact);
+  }
+  return facts;
+}
+
+function valueFromToolFacts(key, facts) {
+  const lower = key.toLowerCase();
+  if (lower === 'versionsmatch' || lower === 'versionmatch') return undefined;
+  const wantsRead = lower.startsWith('read') || lower.includes('read');
+  const wantsBash = lower.startsWith('bash') || lower.includes('bash');
+  const wantsVersion = lower.includes('version');
+  const wantsName = lower.includes('name') || lower.includes('package');
+  const candidates = wantsRead ? (facts.byTool.read || [])
+    : wantsBash ? (facts.byTool.bash || [])
+      : facts.all;
+
+  if (wantsVersion) {
+    for (const f of candidates) {
+      if (plainObject(f.parsed)) {
+        const v = findDeepValue(f.parsed, 'version');
+        if (v !== undefined) return v;
+      }
+      const m = f.content.match(/\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b/);
+      if (m) return m[0];
+    }
+  }
+  if (wantsName) {
+    for (const f of candidates) {
+      if (plainObject(f.parsed)) {
+        const v = findDeepValue(f.parsed, 'name');
+        if (v !== undefined) return v;
+      }
+    }
+  }
+  if (lower === 'ok') return true;
+  return undefined;
+}
+
+export function stabilizeJsonPayload(text, messages) {
+  const keys = extractRequestedJsonKeys(messages);
+  if (!keys.length) return text;
+  const cleaned = extractJsonPayload(text);
+  const parsed = safeJsonParse(cleaned);
+  if (!plainObject(parsed)) return cleaned;
+  const existingKeys = Object.keys(parsed);
+  if (existingKeys.length === keys.length && keys.every((k, i) => existingKeys[i] === k)) {
+    return cleaned;
+  }
+
+  const facts = collectToolFacts(messages);
+  const out = {};
+  for (const key of keys) {
+    let v = findDeepValue(parsed, key);
+    if (v === undefined) v = valueFromToolFacts(key, facts);
+    out[key] = v === undefined ? null : v;
+  }
+  for (const key of keys) {
+    const lower = key.toLowerCase();
+    if ((lower === 'versionsmatch' || lower === 'versionmatch') && out[key] == null) {
+      const read = out.readVersion ?? out.read_version;
+      const bash = out.bashVersion ?? out.bash_version;
+      if (read != null && bash != null) out[key] = String(read).trim() === String(bash).trim();
+    }
+  }
+  return JSON.stringify(out);
+}
+
+export function applyJsonResponseHint(messages, responseFormat) {
+  let jsonHint = '\n\n[You MUST respond with valid JSON only. No markdown code fences, no explanation text, no prefix/suffix. Your entire response must be a single parseable JSON object. Preserve the exact JSON field names requested by the user, and do not add extra fields when an exact key set is requested. If tool results contain the requested values, put only those values into JSON fields rather than describing them in prose or copying the full tool result.';
+  if (responseFormat?.type === 'json_schema' && responseFormat?.json_schema?.schema) {
+    jsonHint += ' Conform to this JSON Schema:\n' + JSON.stringify(responseFormat.json_schema.schema);
+  }
+  jsonHint += ']';
+
+  const sysJsonMsg = { role: 'system', content: 'Respond with valid JSON only. No markdown, no code fences, no explanation. Output must be parseable by JSON.parse().' };
+  const out = [sysJsonMsg, ...(Array.isArray(messages) ? messages : [])];
+  for (let i = out.length - 1; i >= 1; i--) {
+    if (out[i]?.role !== 'user') continue;
+    const text = textFromMessageContent(out[i].content);
+    if (/^\s*<tool_result\b/i.test(text)) continue;
+    out[i] = { ...out[i], content: appendJsonHintToContent(out[i].content, jsonHint) };
+    break;
+  }
+  return out;
+}
+
 const CASCADE_REUSE_STRICT = process.env.CASCADE_REUSE_STRICT === '1';
 const CASCADE_REUSE_STRICT_RETRY_MS = (() => {
   const n = parseInt(process.env.CASCADE_REUSE_STRICT_RETRY_MS || '', 10);
   return Number.isFinite(n) && n > 0 ? n : 60_000;
 })();
+const OPUS47_TOOL_EMULATED_REUSE = process.env.OPUS47_TOOL_EMULATED_REUSE !== '0';
+const OPUS47_STRICT_REUSE = process.env.OPUS47_STRICT_REUSE !== '0';
 
-// Only non-tool Cascade turns are eligible for cascade_id reuse. Tool-
-// emulated requests (Claude Code / Cline / Cursor with OpenAI tools[])
-// carry <tool_call>/<tool_result> bodies that change every turn, so the
-// fingerprint almost never matches anyway — bypassing the pool avoids
-// wasted checkout/checkin round-trips and keeps the pool clean. (PR #50)
-export function shouldUseCascadeReuse({ useCascade, emulateTools }) {
-  return !!useCascade && !emulateTools;
+function isToolSensitiveOpusModel(modelKey = '') {
+  // Opus-class models share the same prompt-injection / Claude-Code-tools
+  // sensitivity profile, regardless of whether the version label is dotted
+  // (claude-opus-4.6) or dashed (claude-opus-4-7-high). #59 confirmed 4.6
+  // hits the same multi-turn tool-context loss as 4.7, so the strict-reuse
+  // and multimodal-tool-fallback gates apply to both.
+  return /^claude-opus-4(?:[.-]6|[.-]7)(?:[-.]|$)/i.test(String(modelKey || ''));
+}
+
+// Tool-emulated requests are normally kept out of cascade_id reuse because
+// <tool_call>/<tool_result> bodies drift across turns. Opus 4.6 / 4.7 +
+// Claude Code is the exception: replaying the full prompt/tools/image
+// history is worse than preserving the exact upstream cascade, so enable
+// a narrow local path.
+// thinking.type can be 'enabled' (Anthropic spec), 'adaptive' (what
+// Claude Code 2.x sonnet defaults to), or any future variant — accept
+// anything that isn't an explicit 'disabled' so the model still gets
+// routed to the -thinking sibling. The previous strict 'enabled' check
+// silently dropped every adaptive request to the non-thinking model.
+export function isThinkingRequested(body) {
+  const thinkingType = body?.thinking?.type;
+  if (thinkingType && thinkingType !== 'disabled') return true;
+  if (body?.reasoning_effort) return true;
+  return false;
+}
+
+export function shouldUseCascadeReuse({ useCascade, emulateTools, modelKey, allowToolReuse = OPUS47_TOOL_EMULATED_REUSE }) {
+  if (!useCascade) return false;
+  if (!emulateTools) return true;
+  return !!allowToolReuse && isToolSensitiveOpusModel(modelKey);
+}
+
+function shouldForceCascadeReuse({ emulateTools, modelKey }) {
+  return !!emulateTools && OPUS47_TOOL_EMULATED_REUSE && isToolSensitiveOpusModel(modelKey);
+}
+
+export function shouldUseStrictCascadeReuse({ emulateTools, modelKey, strict = CASCADE_REUSE_STRICT, allowOpus47Strict = OPUS47_STRICT_REUSE }) {
+  return !!strict || (!!emulateTools && !!allowOpus47Strict && isToolSensitiveOpusModel(modelKey));
+}
+
+function hasMultimodalContent(messages) {
+  if (!Array.isArray(messages)) return false;
+  return messages.some(m => Array.isArray(m?.content) && m.content.some(p => {
+    const type = String(p?.type || '').toLowerCase();
+    return type === 'image' || type === 'image_url' || type === 'input_image'
+      || type === 'document' || type === 'file' || type === 'input_file'
+      || p?.source?.type === 'base64' || p?.image_url;
+  }));
 }
 
 function strictReuseRetryMs(availability) {
@@ -103,9 +377,97 @@ function strictReuseMessage(model, retryMs, reason = 'temporarily unavailable') 
   return `${model} 上下文复用绑定账号暂不可用（${reason}）。为避免切换账号导致上下文丢失，请 ${Math.ceil(retryMs / 1000)} 秒后重试`;
 }
 
-function rateLimitCooldownMs(message = '') {
+function recentUserText(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') return contentToString(messages[i].content);
+  }
+  return '';
+}
+
+function shellUnquote(text) {
+  const s = String(text || '').trim();
+  if (s.length >= 2 && ((s[0] === '"' && s.at(-1) === '"') || (s[0] === '\'' && s.at(-1) === '\''))) {
+    return s.slice(1, -1);
+  }
+  return s;
+}
+
+function trimCommandSentence(text) {
+  const s = String(text || '').trim();
+  let quote = '';
+  let escaped = false;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === '\\' && quote) { escaped = true; continue; }
+    if (quote) {
+      if (ch === quote) quote = '';
+      continue;
+    }
+    if (ch === '"' || ch === '\'') {
+      quote = ch;
+      continue;
+    }
+    if (ch === '.' && /\s/.test(s[i + 1] || '')) return s.slice(0, i).trim();
+  }
+  return s.replace(/[.。]\s*$/, '').trim();
+}
+
+function extractRequestedBashCommands(text) {
+  const src = String(text || '');
+  const out = [];
+  const patterns = [
+    /(?:command|run|execute)\s+(?:exactly\s+)?(?::\s*)?`([^`]+)`/gi,
+    /(?:command|run|execute)\s+(?:exactly\s+)?(?::\s*)?([^\n]+)/gi,
+  ];
+  for (const re of patterns) {
+    for (const m of src.matchAll(re)) {
+      const candidate = shellUnquote(trimCommandSentence(m[1])).trim();
+      if (candidate && /\s/.test(candidate)) out.push(candidate);
+    }
+  }
+  return [...new Set(out)];
+}
+
+export function repairToolCallArguments(tc, messages) {
+  if (!tc || String(tc.name || '').toLowerCase() !== 'bash' || typeof tc.argumentsJson !== 'string') return tc;
+  let args;
+  try { args = JSON.parse(tc.argumentsJson); } catch { return tc; }
+  if (!args || typeof args.command !== 'string') return tc;
+  const current = args.command.trim();
+  if (!current) return tc;
+  for (const requested of extractRequestedBashCommands(recentUserText(messages))) {
+    if (requested.length > current.length && requested.startsWith(current)) {
+      return { ...tc, argumentsJson: JSON.stringify({ ...args, command: requested }) };
+    }
+  }
+  return tc;
+}
+
+export function rateLimitCooldownMs(message = '') {
+  const reset = String(message || '').match(/resets?\s+in\s*:?\s*((?:(?:\d+)\s*[hms]\s*)+)/i);
+  if (reset) {
+    let total = 0;
+    for (const part of reset[1].matchAll(/(\d+)\s*([hms])/gi)) {
+      const n = Number(part[1]);
+      const unit = part[2].toLowerCase();
+      if (unit === 'h') total += n * 60 * 60 * 1000;
+      else if (unit === 'm') total += n * 60 * 1000;
+      else total += n * 1000;
+    }
+    if (total > 0) return total;
+  }
+  const m = String(message || '').match(/(?:retry (?:after|in)|after)\s+(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)/i);
+  if (m) {
+    const n = Number(m[1]);
+    const unit = m[2].toLowerCase();
+    if (unit.startsWith('h')) return n * 60 * 60 * 1000;
+    if (unit.startsWith('m')) return n * 60 * 1000;
+    return n * 1000;
+  }
   if (/about an hour|in an hour|try again in.*hour/i.test(message)) return 60 * 60 * 1000;
-  return 5 * 60 * 1000;
+  return 60 * 1000;
 }
 
 function genId() {
@@ -193,7 +555,7 @@ export function extractCallerEnvironment(messages) {
   // The capture group is locked to `[/~]…` so we only grab actual-looking
   // paths — "the working directory you choose" or similar abstract prose
   // never has a `/` or `~` in the captured slot and is rejected.
-  const PATH_TAIL = `[\\/~][^\\s\`'"<>\\n.,;)]+`;
+  const PATH_TAIL = `(?:[\\/~]|[A-Za-z]:\\\\)[^\\s\`'"<>\\n.,;)]+`;
   const PATTERNS = [
     ['cwd', new RegExp(
       // Form (a): line-anchored key/value
@@ -278,6 +640,32 @@ function cachedUsage(messages, completionText) {
   };
 }
 
+export function applyToolPreambleBudget(tools, toolChoice, callerEnv = '', opts = {}) {
+  const full = buildToolPreambleForProto(tools || [], toolChoice, callerEnv);
+  const softBytes = opts.softBytes ?? parseInt(process.env.TOOL_PREAMBLE_SOFT_BYTES || '24000', 10);
+  const hardBytes = opts.hardBytes ?? parseInt(process.env.TOOL_PREAMBLE_HARD_BYTES || '48000', 10);
+  if (!full) {
+    return { ok: true, preamble: '', fullBytes: 0, finalBytes: 0, compacted: false, softBytes, hardBytes };
+  }
+
+  const fullBytes = Buffer.byteLength(full, 'utf8');
+  let preamble = full;
+  let finalBytes = fullBytes;
+  let compacted = false;
+
+  if (fullBytes > softBytes) {
+    preamble = buildCompactToolPreambleForProto(tools || [], toolChoice, callerEnv);
+    finalBytes = Buffer.byteLength(preamble, 'utf8');
+    compacted = true;
+  }
+
+  if (finalBytes > hardBytes) {
+    return { ok: false, preamble, fullBytes, finalBytes, compacted, softBytes, hardBytes };
+  }
+
+  return { ok: true, preamble, fullBytes, finalBytes, compacted, softBytes, hardBytes };
+}
+
 /**
  * Build an OpenAI-shaped `usage` object, preferring server-reported token
  * counts from Cascade's CortexStepMetadata.model_usage when available, and
@@ -295,13 +683,33 @@ function cachedUsage(messages, completionText) {
  *   prompt_tokens_details.cached_tokens       = cacheReadTokens
  *   cache_creation_input_tokens (Anthropic ext) = cacheWriteTokens
  */
-function buildUsageBody(serverUsage, messages, completionText, thinkingText = '') {
+// Anthropic prompt-caching ttl='1h' markers should keep the cascade
+// pool entry alive past its 30-minute default. 90 minutes = 1h cache
+// window + 30 min slack so the next turn comfortably falls inside the
+// extended TTL. 5m markers (the spec default) need no hint — the
+// pool's default already covers them.
+function ttlHintFromCachePolicy(cachePolicy) {
+  if (!cachePolicy?.has1h) return undefined;
+  return 90 * 60 * 1000;
+}
+
+function buildUsageBody(serverUsage, messages, completionText, thinkingText = '', cachePolicy = null) {
   if (serverUsage && (serverUsage.inputTokens || serverUsage.outputTokens)) {
     const inputTokens = serverUsage.inputTokens || 0;
     const outputTokens = serverUsage.outputTokens || 0;
     const cacheRead = serverUsage.cacheReadTokens || 0;
     const cacheWrite = serverUsage.cacheWriteTokens || 0;
     const promptTotal = inputTokens + cacheRead + cacheWrite;
+    // Anthropic prompt-caching split: when the client tagged any block
+    // with ttl='1h' the creation tokens go to ephemeral_1h, otherwise to
+    // ephemeral_5m. Cascade doesn't separate the pools so we can't
+    // attribute byte-for-byte; this is the binary "any 1h?" routing
+    // Anthropic's own API documents and matches what real clients see
+    // when they use a single TTL per request (which is the common case).
+    const cacheCreationSplit = {
+      ephemeral_5m_input_tokens: cachePolicy?.has1h ? 0 : cacheWrite,
+      ephemeral_1h_input_tokens: cachePolicy?.has1h ? cacheWrite : 0,
+    };
     return {
       prompt_tokens: promptTotal,
       completion_tokens: outputTokens,
@@ -311,6 +719,8 @@ function buildUsageBody(serverUsage, messages, completionText, thinkingText = ''
       prompt_tokens_details: { cached_tokens: cacheRead },
       completion_tokens_details: { reasoning_tokens: 0 },
       cache_creation_input_tokens: cacheWrite,
+      cache_read_input_tokens: cacheRead,
+      cache_creation: cacheCreationSplit,
     };
   }
   const prompt = estimateTokens(messages);
@@ -341,7 +751,7 @@ async function waitForAccount(tried, signal, maxWaitMs = QUEUE_MAX_WAIT_MS, mode
   return acct;
 }
 
-export async function handleChatCompletions(body) {
+export async function handleChatCompletions(body, context = {}) {
   const reqId = Math.random().toString(36).slice(2, 8);
   const {
     model: reqModel,
@@ -352,6 +762,10 @@ export async function handleChatCompletions(body) {
     response_format,
   } = body;
   let messages = body.messages;
+  const callerKey = context.callerKey || body.__callerKey || '';
+  const cachePolicy = body.__cachePolicy || null;
+  const checkMessageRateLimitFn = context.checkMessageRateLimit || checkMessageRateLimit;
+  const waitForAccountFn = context.waitForAccount || waitForAccount;
 
   // Probe diagnostics: dump compact request shape for every call, plus a
   // tail of the last user turn. Keeps us able to see how third-party
@@ -370,40 +784,98 @@ export async function handleChatCompletions(body) {
           : Array.isArray(c) ? c.filter(p => p?.type === 'text').map(p => p.text || '').join(' ') : '';
       }
     }
-    const tail = lastUserText.length > 140 ? '…' + lastUserText.slice(-140) : lastUserText;
-    log.info(`Probe[${reqId}]: model=${reqModel} stream=${!!stream} rf=${response_format?.type || 'none'} tools=${Array.isArray(tools) ? tools.length : 0} reasoning=${body.reasoning_effort || body.thinking?.type || 'none'} ctypes=[${[...contentTypes].join(',')}] turns=${messages?.length || 0} lastUser="${tail.replace(/\n/g, '\\n').replace(/"/g, '\\"')}"`);
+    log.info(`Probe[${reqId}]: model=${reqModel} stream=${!!stream} rf=${response_format?.type || 'none'} tools=${Array.isArray(tools) ? tools.length : 0} reasoning=${body.reasoning_effort || body.thinking?.type || 'none'} ctypes=[${[...contentTypes].join(',')}] turns=${messages?.length || 0} lastUser=${requestLogSummary(lastUserText, 140)}`);
     // Also dump first-user / system content so we can see preambles.
     for (let mi = 0; mi < Math.min((messages || []).length, 3); mi++) {
       const m = messages[mi];
       const c = typeof m?.content === 'string' ? m.content : Array.isArray(m?.content) ? m.content.map(p => p?.type === 'text' ? p.text : `[${p?.type}]`).join('|') : '';
-      log.info(`Probe[${reqId}] msg[${mi}] role=${m?.role} len=${c.length} head="${c.slice(0, 220).replace(/\n/g, '\\n').replace(/"/g, '\\"')}"`);
+      log.info(`Probe[${reqId}] msg[${mi}] role=${m?.role} ${requestLogSummary(c)}`);
     }
   } catch {}
 
-  const wantJson = response_format?.type === 'json_object' || response_format?.type === 'json_schema';
-  if (wantJson) {
-    let jsonHint = '\n\n[You MUST respond with valid JSON only. No markdown code fences, no explanation text, no prefix/suffix. Your entire response must be a single parseable JSON object.';
-    if (response_format?.type === 'json_schema' && response_format?.json_schema?.schema) {
-      jsonHint += ' Conform to this JSON Schema:\n' + JSON.stringify(response_format.json_schema.schema);
-    }
-    jsonHint += ']';
-    const sysJsonMsg = { role: 'system', content: 'Respond with valid JSON only. No markdown, no code fences, no explanation. Output must be parseable by JSON.parse().' };
-    messages = [sysJsonMsg, ...messages.map((m, i) => {
-      if (i === messages.length - 1 && m.role === 'user') {
-        const content = typeof m.content === 'string' ? m.content + jsonHint : m.content;
-        return { ...m, content };
+  // Reject pathologically empty user turns. Without this, an empty
+  // `user.content` slips through and the model answers against the
+  // system prompt as if it were the user's prompt, producing nonsense
+  // output (caught by the OpenClaw human-scenario probe — scenario #14).
+  // Match OpenAI's behaviour: 400 invalid_request_error.
+  {
+    const lastUser = (messages || []).filter(m => m?.role === 'user').pop();
+    if (lastUser) {
+      const c = lastUser.content;
+      let trimmedBytes = 0;
+      if (typeof c === 'string') trimmedBytes = c.trim().length;
+      else if (Array.isArray(c)) trimmedBytes = c.reduce((n, p) => {
+        if (typeof p?.text === 'string') return n + p.text.trim().length;
+        // Non-text parts (image_url / input_audio / file / etc.) count as
+        // non-empty content — only pure-text empties trigger the 400.
+        if (p && typeof p === 'object' && p.type && p.type !== 'text') return n + 1;
+        return n;
+      }, 0);
+      if (trimmedBytes === 0) {
+        return {
+          status: 400,
+          body: {
+            error: {
+              message: 'The last user message has empty content. Provide a non-empty user prompt.',
+              type: 'invalid_request_error',
+              param: 'messages',
+            },
+          },
+        };
       }
-      return m;
-    })];
+    }
+  }
+
+  // Heavy clients (OpenClaw 24KB, opencode + omo, Cline with full tool
+  // catalog) ship system prompts that approach Cascade's ~30KB panel-
+  // state ceiling. When that happens upstream intermittently returns
+  // `internal error occurred` or invalidates panel state. Surface the
+  // size in logs so intermittent failures can be correlated with caller
+  // payload rather than chased as proxy bugs.
+  {
+    const sysBytes = (messages || []).filter(m => m?.role === 'system').reduce((n, m) => {
+      const c = m?.content;
+      return n + (typeof c === 'string' ? c.length : Array.isArray(c) ? c.reduce((k, p) => k + (typeof p?.text === 'string' ? p.text.length : 0), 0) : 0);
+    }, 0);
+    if (sysBytes >= 8000) {
+      log.warn(`Probe[${reqId}]: large system prompt ${Math.round(sysBytes/1024)}KB — heavy clients (OpenClaw / Cline / opencode) may hit upstream panel-state retries above ~30KB`);
+    }
+  }
+
+  const explicitJson = isExplicitJsonRequested(messages);
+  const wantJson = response_format?.type === 'json_object' || response_format?.type === 'json_schema' || explicitJson;
+  if (wantJson) {
+    messages = applyJsonResponseHint(messages, response_format);
   }
 
   const modelKey = resolveModel(reqModel || config.defaultModel);
-  const wantThinking = !!(body.thinking?.type === 'enabled' || body.reasoning_effort);
+  const wantThinking = isThinkingRequested(body);
   let effectiveModelKey = modelKey;
   if (wantThinking && !modelKey.includes('thinking') && getModelInfo(modelKey + '-thinking')) {
     effectiveModelKey = modelKey + '-thinking';
   }
+  if (effectiveModelKey !== modelKey) {
+    log.info(`Chat[${reqId}]: routed ${modelKey} -> ${effectiveModelKey} (wantThinking=${wantThinking})`);
+  }
   const modelInfo = getModelInfo(effectiveModelKey) || getModelInfo(modelKey);
+  // Reject unknown models. Without this, chat.js used to fall through to
+  // legacy rawGetChatMessage with modelEnum=0 and modelUid=null, which
+  // upstream silently routed to a default model. Callers saw "I'm Claude 4.5"
+  // when they asked for `claude-4.6` (issue #68), or got blank responses for
+  // typos. Fail fast with the same shape OpenAI uses.
+  if (!modelInfo) {
+    return {
+      status: 400,
+      body: {
+        error: {
+          message: `Unsupported model: ${reqModel || config.defaultModel}`,
+          type: 'invalid_request_error',
+          param: 'model',
+          code: 'model_not_found',
+        },
+      },
+    };
+  }
   // Return the user's original model name in response.model / response headers
   // so external test harnesses (e.g. hvoy.ai "model signature" check) see
   // exactly what they sent, not a Windsurf-internal alias like
@@ -439,7 +911,36 @@ export async function handleChatCompletions(body) {
   // prompt can no longer override them with /tmp/windsurf-workspace
   // priors. See extractCallerEnvironment() above for the parser.
   const callerEnv = emulateTools ? extractCallerEnvironment(messages) : '';
-  const toolPreamble = emulateTools ? buildToolPreambleForProto(tools || [], tool_choice, callerEnv) : '';
+  let toolPreamble = '';
+  // Payload budget for the proto-level tool preamble. The upstream LS
+  // panel state caps total request size at ~30KB; the preamble alone can
+  // approach that with 30+ tools (Claude Code, opencode, Cline). Past the
+  // soft cap we drop full schemas and ship names-only — the model still
+  // knows what tools exist and how to invoke them, just not parameter
+  // shapes. Only the actual payload after fallback is compared with the
+  // hard cap; v2.0.9 rejected on the full-schema size before compacting,
+  // which broke real opencode / Claude Code setups with 30-50 MCP tools.
+  if (emulateTools) {
+    const budget = applyToolPreambleBudget(tools || [], tool_choice, callerEnv);
+    if (budget.fullBytes > budget.softBytes && budget.compacted) {
+      log.warn(`Probe[${reqId}]: toolPreamble ${Math.round(budget.fullBytes / 1024)}KB exceeds soft cap ${Math.round(budget.softBytes / 1024)}KB; falling back to names-only preamble (${Math.round(budget.finalBytes / 1024)}KB, ${(tools || []).length} tools)`);
+    }
+    if (!budget.ok) {
+      log.warn(`Probe[${reqId}]: toolPreamble ${Math.round(budget.finalBytes / 1024)}KB exceeds hard cap ${Math.round(budget.hardBytes / 1024)}KB after ${budget.compacted ? 'names-only fallback' : 'full-schema build'}; rejecting (${(tools || []).length} tools)`);
+      return {
+        status: 400,
+        body: {
+          error: {
+            message: `Tool definitions are too large (${Math.round(budget.finalBytes / 1024)}KB > ${Math.round(budget.hardBytes / 1024)}KB after compaction). Reduce the number of tools or shorten tool names.`,
+            type: 'invalid_request_error',
+            param: 'tools',
+            code: 'tool_preamble_too_large',
+          },
+        },
+      };
+    }
+    toolPreamble = budget.preamble;
+  }
   // Diagnostic: surface whether environment lifting actually fired so a real
   // request log immediately tells us if Claude Code 2.x changed `<env>` block
   // wording, or if the extraction guard rejected a valid hint. Cheap to log,
@@ -463,8 +964,12 @@ export async function handleChatCompletions(body) {
       log.info(`Chat[${reqId}]: env NOT lifted (extractor returned empty)${probe ? '; nearest env-shaped substring in messages: ' + probe : '; no env-shaped substring found in any message'}`);
     }
   }
+  const disableUserToolFallback = emulateTools && isToolSensitiveOpusModel(modelKey) && hasMultimodalContent(messages);
+  if (disableUserToolFallback) {
+    log.info(`Chat[${reqId}]: disabled user-message tool fallback for Opus 4.x multimodal turn`);
+  }
   let cascadeMessages = emulateTools
-    ? normalizeMessagesForCascade(messages, tools)
+    ? normalizeMessagesForCascade(messages, tools, { injectUserPreamble: !disableUserToolFallback })
     : [...messages];
 
   // Note: previous versions injected (a) a CJK language-following hint into
@@ -528,7 +1033,11 @@ export async function handleChatCompletions(body) {
   const ckey = cacheKey(body);
 
   if (stream) {
-    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId, wantJson);
+    return streamResponse(chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId, wantJson, callerKey, {
+      checkMessageRateLimit: checkMessageRateLimitFn,
+      waitForAccount: waitForAccountFn,
+      cachePolicy,
+    });
   }
 
   // ── Local response cache (exact body match) ─────────────
@@ -555,15 +1064,23 @@ export async function handleChatCompletions(body) {
   // instead of replaying the whole history.
   //
   // Conversation reuse lets Cascade keep server-side context across turns.
-  const reuseEnabled = shouldUseCascadeReuse({ useCascade, emulateTools }) && isExperimentalEnabled('cascadeConversationReuse');
-  const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey) : null;
-  let reuseEntry = reuseEnabled ? poolCheckout(fpBefore) : null;
+  const reuseEnabled = shouldUseCascadeReuse({ useCascade, emulateTools, modelKey })
+    && (isExperimentalEnabled('cascadeConversationReuse') || shouldForceCascadeReuse({ emulateTools, modelKey }));
+  const strictReuse = shouldUseStrictCascadeReuse({ emulateTools, modelKey });
+  const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey) : null;
+  let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey) : null;
   let checkedOutReuseEntry = reuseEntry;
   if (reuseEntry) log.info(`Chat[${reqId}]: reuse HIT cascade=${reuseEntry.cascadeId.slice(0, 8)} model=${displayModel}`);
 
   // Non-stream: retry with a different account on model-not-available errors
   const tried = [];
   let lastErr = null;
+  // Count upstream_internal_error hits separately from rate_limit / model
+  // errors. When >0 we add backoff between attempts (give upstream a
+  // breather), and when ALL attempts hit it we surface a clean
+  // upstream_transient_error instead of the misleading "rate limit"
+  // message the all-accounts-exhausted branch would otherwise produce.
+  let internalCount = 0;
   // Dynamic: try every active account in the pool (capped at 10) so a
   // large pool with many rate-limited accounts can still fall through
   // to a free one. Was hardcoded 3 — in pools bigger than 3 with the
@@ -584,10 +1101,10 @@ export async function handleChatCompletions(body) {
         }
         if (!acct) {
           log.info(`Chat[${reqId}]: reuse MISS — owning account not available after 5s wait`);
-          if (CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore) {
+          if (strictReuse && checkedOutReuseEntry && fpBefore) {
             const availability = getAccountAvailability(checkedOutReuseEntry.apiKey, modelKey);
             const retryAfterMs = strictReuseRetryMs(availability);
-            poolCheckin(fpBefore, checkedOutReuseEntry);
+            poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
             log.info(`Chat[${reqId}]: strict reuse preserved cascade; owner unavailable reason=${availability.reason}`);
             return {
               status: 429,
@@ -606,8 +1123,27 @@ export async function handleChatCompletions(body) {
       }
     }
     if (!acct) {
-      acct = await waitForAccount(tried, null, QUEUE_MAX_WAIT_MS, modelKey);
-      if (!acct) break;
+      acct = await waitForAccountFn(tried, null, QUEUE_MAX_WAIT_MS, modelKey);
+      if (!acct) {
+        // Same diagnostic-error fix as the stream path — surface real reason
+        // for the queue timeout (rate limit / no entitlement / upstream stall)
+        // so the client gets a useful message instead of falling through to
+        // a generic pool_exhausted error from the bottom of this function.
+        if (!lastErr) {
+          const tempUnavail = isAllTemporarilyUnavailable(modelKey);
+          const rateLimited = isAllRateLimited(modelKey);
+          const reason = tempUnavail.allUnavailable
+            ? `所有可用账号暂时不可用，请 ${Math.ceil(tempUnavail.retryAfterMs / 1000)} 秒后重试`
+            : rateLimited.allLimited
+            ? `所有可用账号均已达速率限制，请 ${Math.ceil(rateLimited.retryAfterMs / 1000)} 秒后重试`
+            : `${Math.ceil(QUEUE_MAX_WAIT_MS / 1000)} 秒内没有账号变为可用 — 账号可能被速率限制或对当前模型无权限`;
+          lastErr = {
+            status: (tempUnavail.allUnavailable || rateLimited.allLimited) ? 429 : 503,
+            body: { error: { message: `${displayModel} 账号队列超时: ${reason}`, type: (tempUnavail.allUnavailable || rateLimited.allLimited) ? 'rate_limit_exceeded' : 'pool_exhausted' } },
+          };
+        }
+        break;
+      }
     }
     tried.push(acct.apiKey);
 
@@ -617,14 +1153,17 @@ export async function handleChatCompletions(body) {
     if (isExperimentalEnabled('preflightRateLimit')) {
       try {
         const px = getEffectiveProxy(acct.id) || null;
-        const rl = await checkMessageRateLimit(acct.apiKey, px);
+        const rl = await checkMessageRateLimitFn(acct.apiKey, px);
         if (!rl.hasCapacity) {
           log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
-          markRateLimited(acct.apiKey, 5 * 60 * 1000, modelKey);
-          if (CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
+          refundReservation(acct.apiKey, acct.reservationTimestamp);
+          if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
+            markRateLimited(acct.apiKey, rl.retryAfterMs, modelKey);
+          }
+          if (strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
             const availability = getAccountAvailability(acct.apiKey, modelKey);
             const retryAfterMs = strictReuseRetryMs(availability);
-            poolCheckin(fpBefore, checkedOutReuseEntry);
+            poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
             log.info(`Chat[${reqId}]: strict reuse preserved cascade after preflight rate limit`);
             return {
               status: 429,
@@ -665,8 +1204,8 @@ export async function handleChatCompletions(body) {
     const result = await nonStreamResponse(
       client, chatId, created, displayModel, modelKey, messages, cascadeMessages, modelEnum, modelUid,
       useCascade, acct.apiKey, ckey,
-      reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey } : null,
-      emulateTools, toolPreamble, wantJson,
+      reuseEnabled ? { reuseEntry, lsPort: ls.port, apiKey: acct.apiKey, callerKey, cachePolicy } : null,
+      emulateTools, toolPreamble, wantJson, cachePolicy,
     );
     if (result.status === 200) return result;
     reuseEntry = null; // don't try to reuse on the retry
@@ -674,10 +1213,10 @@ export async function handleChatCompletions(body) {
     const errType = result.body?.error?.type;
     // Rate limit: this account is done for this model, try the next one
     if (errType === 'rate_limit_exceeded') {
-      if (CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
+      if (strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
         const availability = getAccountAvailability(acct.apiKey, modelKey);
         const retryAfterMs = strictReuseRetryMs(availability);
-        poolCheckin(fpBefore, checkedOutReuseEntry);
+        poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
         log.info(`Chat[${reqId}]: strict reuse preserved cascade after rate limit`);
         return {
           status: 429,
@@ -694,6 +1233,13 @@ export async function handleChatCompletions(body) {
       log.warn(`Account ${acct.email} rate-limited on ${displayModel}, trying next account`);
       continue;
     }
+    // Cascade transient 错误通常是上游或本地 LS 短暂抖动，先退避再切账号，避免连续打爆同一热窗口。
+    if (errType === 'upstream_internal_error' || errType === 'upstream_transient_error') {
+      internalCount++;
+      const backoffMs = await internalErrorBackoff(internalCount - 1);
+      log.warn(`Chat[${reqId}]: ${acct.email} upstream transient error, waited ${backoffMs}ms before next account`);
+      continue;
+    }
     // Model not available on this account (permission_denied, etc.)
     if (errType === 'model_not_available') {
       log.warn(`Account ${acct.email} cannot serve ${displayModel}, trying next account`);
@@ -707,12 +1253,44 @@ export async function handleChatCompletions(body) {
       if (acct) releaseAccount(acct.apiKey);
     }
   }
+  // 所有账号都遇到 Cascade transient 时，账号轮换已经无法修复；返回明确错误，避免误报成限流或模型不可用。
+  if (internalCount > 0 && tried.length > 0 && internalCount >= tried.length) {
+    if (checkedOutReuseEntry && fpBefore) {
+      poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
+      log.info(`Chat[${reqId}]: restored checked-out cascade after all-internal-error chain`);
+    }
+    const lastIsTransport = isCascadeTransportError(lastErr);
+    log.error(`Chat[${reqId}]: ${tried.length}/${tried.length} accounts hit upstream transient error — surfacing upstream_transient_error`);
+    return {
+      status: 502,
+      body: { error: { message: upstreamTransientErrorMessage(displayModel, tried.length, lastIsTransport ? 'cascade_transport' : 'internal_error'), type: 'upstream_transient_error' } },
+    };
+  }
   // If all accounts exhausted, check if it's because they're all rate-limited
+  const temporaryUnavailable = isAllTemporarilyUnavailable(modelKey);
+  if (temporaryUnavailable.allUnavailable) {
+    if (checkedOutReuseEntry && fpBefore) {
+      poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
+      log.info(`Chat[${reqId}]: restored checked-out cascade after temporary unavailability`);
+    }
+    const retryAfterSec = Math.ceil(temporaryUnavailable.retryAfterMs / 1000);
+    return {
+      status: 429,
+      headers: { 'Retry-After': String(retryAfterSec) },
+      body: {
+        error: {
+          message: `${displayModel} 所有账号暂时不可用，请 ${retryAfterSec} 秒后重试`,
+          type: 'rate_limit_exceeded',
+          retry_after_ms: temporaryUnavailable.retryAfterMs,
+        },
+      },
+    };
+  }
   if (!lastErr || lastErr.status === 429) {
     const rl = isAllRateLimited(modelKey);
     if (rl.allLimited) {
       if (checkedOutReuseEntry && fpBefore) {
-        poolCheckin(fpBefore, checkedOutReuseEntry);
+        poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
         log.info(`Chat[${reqId}]: restored checked-out cascade after rate limit`);
       }
       const retryAfterSec = Math.ceil(rl.retryAfterMs / 1000);
@@ -720,13 +1298,13 @@ export async function handleChatCompletions(body) {
     }
   }
   if (checkedOutReuseEntry && fpBefore) {
-    poolCheckin(fpBefore, checkedOutReuseEntry);
+    poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
     log.info(`Chat[${reqId}]: restored checked-out cascade after failed request`);
   }
   return lastErr || { status: 503, body: { error: { message: 'No active accounts available', type: 'pool_exhausted' } } };
 }
 
-async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble, wantJson = false) {
+async function nonStreamResponse(client, id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, apiKey, ckey, poolCtx, emulateTools, toolPreamble, wantJson = false, cachePolicy = null) {
   const startTime = Date.now();
   try {
     let allText = '';
@@ -774,17 +1352,17 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     allText = sanitizeText(allText);
     allText = neutralizeCascadeIdentity(allText, model);
     if (wantJson && allText) {
-      allText = extractJsonPayload(allText);
+      allText = stabilizeJsonPayload(allText, messages);
     }
     allThinking = sanitizeText(allThinking);
     if (toolCalls.length) {
-      toolCalls = toolCalls.map(tc => sanitizeToolCall(tc));
+      toolCalls = toolCalls.map(tc => sanitizeToolCall(repairToolCallArguments(tc, messages)));
     }
 
     // Check the cascade back into the pool under the *post-turn* fingerprint
     // so the next request in the same conversation can resume it.
-    if (poolCtx && cascadeMeta?.cascadeId && allText) {
-      const fpAfter = fingerprintAfter(messages, modelKey);
+    if (poolCtx && cascadeMeta?.cascadeId && (allText || toolCalls.length)) {
+      const fpAfter = fingerprintAfter(messages, modelKey, poolCtx.callerKey || '');
       poolCheckin(fpAfter, {
         cascadeId: cascadeMeta.cascadeId,
         sessionId: cascadeMeta.sessionId,
@@ -793,7 +1371,7 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
         stepOffset: Number.isFinite(cascadeMeta.stepOffset) ? cascadeMeta.stepOffset : poolCtx.reuseEntry?.stepOffset,
         generatorOffset: Number.isFinite(cascadeMeta.generatorOffset) ? cascadeMeta.generatorOffset : poolCtx.reuseEntry?.generatorOffset,
         createdAt: poolCtx.reuseEntry?.createdAt,
-      });
+      }, poolCtx.callerKey || '', ttlHintFromCachePolicy(poolCtx.cachePolicy));
     }
 
     reportSuccess(apiKey);
@@ -827,8 +1405,11 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     }
 
     // Prefer server-reported usage; fall back to chars/4 estimate only when
-    // the trajectory didn't include a ModelUsageStats field.
-    const usage = buildUsageBody(serverUsage, messages, allText, allThinking);
+    // the trajectory didn't include a ModelUsageStats field. cachePolicy is
+    // threaded through as its own parameter rather than via poolCtx so that
+    // non-reuse requests with `cache_control: { ttl: '1h' }` still attribute
+    // their tokens to ephemeral_1h_input_tokens correctly (see #82, #83).
+    const usage = buildUsageBody(serverUsage, messages, allText, allThinking, cachePolicy);
     const finishReason = toolCalls.length ? 'tool_calls' : 'stop';
     return {
       status: 200,
@@ -844,10 +1425,13 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
     const isAuthFail = /unauthenticated|invalid api key|invalid_grant|permission_denied.*account/i.test(err.message);
     const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
     const isInternal = /internal error occurred.*error id/i.test(err.message);
+    const isTransport = isCascadeTransportError(err);
+    const isTransient = isUpstreamTransientError(err, isInternal);
     if (isAuthFail) reportError(apiKey);
-    if (isRateLimit) { markRateLimited(apiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; }
-    if (isInternal) { reportInternalError(apiKey); err.isModelError = true; }
-    if (err.isModelError && !isRateLimit && !isInternal) {
+    if (isRateLimit) { markRateLimited(apiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
+    if (isInternal) { reportInternalError(apiKey); err.isModelError = true; err.kind ||= 'transient_stall'; }
+    if (isTransport) { err.isModelError = true; err.kind ||= 'transient_stall'; }
+    if (err.isModelError && err.kind !== 'transient_stall' && !isRateLimit && !isInternal) {
       updateCapability(apiKey, modelKey, false, 'model_error');
     }
     recordRequest(model, false, Date.now() - startTime, apiKey);
@@ -882,13 +1466,26 @@ async function nonStreamResponse(client, id, created, model, modelKey, messages,
       }
     }
     return {
-      status: err.isModelError ? 403 : 502,
-      body: { error: { message: sanitizeText(err.message), type: err.isModelError ? 'model_not_available' : 'upstream_error' } },
+      status: isTransient ? 502 : (err.isModelError ? 403 : 502),
+      body: { error: {
+        message: isTransient
+          ? upstreamTransientErrorMessage(model, 1, isTransport ? 'cascade_transport' : 'internal_error')
+          : sanitizeText(err.message),
+        type: isTransient ? 'upstream_transient_error' : (err.isModelError ? 'model_not_available' : 'upstream_error'),
+      } },
     };
   }
 }
 
-function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId, wantJson = false) {
+function streamResponse(id, created, model, modelKey, messages, cascadeMessages, modelEnum, modelUid, useCascade, ckey, emulateTools, toolPreamble, reqId, wantJson = false, callerKey = '', deps = {}) {
+  const checkMessageRateLimitFn = deps.checkMessageRateLimit || checkMessageRateLimit;
+  const waitForAccountFn = deps.waitForAccount || waitForAccount;
+  // Cache policy threads through deps because streamResponse is a top-level
+  // helper, not a closure. Without this, lines that compute TTL hints or
+  // attribute usage to ephemeral_5m_input_tokens / ephemeral_1h_input_tokens
+  // throw a ReferenceError mid-stream — the exact failure surface reported
+  // in issues #82 and #83.
+  const cachePolicy = deps.cachePolicy || null;
   return {
     status: 200,
     stream: true,
@@ -900,6 +1497,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
     },
     async handler(res) {
       const abortController = new AbortController();
+      let unregisterSse = () => {};
       res.on('close', () => {
         if (!res.writableEnded) {
           log.info('Client disconnected mid-stream, aborting upstream');
@@ -909,6 +1507,16 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
       const send = (data) => {
         if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
       };
+      unregisterSse = registerSseController({
+        abort(reason) {
+          send(chatStreamError(reason || 'server shutting down', 'server_error', 'server_shutdown'));
+          if (!res.writableEnded) {
+            res.write('data: [DONE]\n\n');
+            res.end();
+          }
+          abortController.abort(reason);
+        },
+      });
 
       // SSE heartbeat: keep the TCP/HTTP connection alive through any silent
       // period (LS warmup, Cascade "thinking", queue wait). `:` prefix is a
@@ -937,10 +1545,12 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               choices: [{ index: 0, delta: { content: cached.text }, finish_reason: null }] });
           }
           send({ id, object: 'chat.completion.chunk', created, model,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
-            usage: cachedUsage(messages, cached.text) });
+            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+          send({ id, object: 'chat.completion.chunk', created, model,
+            choices: [], usage: cachedUsage(messages, cached.text) });
           if (!res.writableEnded) { res.write('data: [DONE]\n\n'); res.end(); }
         } finally {
+          unregisterSse();
           stopHeartbeat();
         }
         return;
@@ -952,6 +1562,11 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
       let rolePrinted = false;
       let currentApiKey = null;
       let lastErr = null;
+      // Same purpose as nonStreamResponse's internalCount: track upstream
+      // internal_error hits across attempts so we can (a) back off
+      // between accounts and (b) surface upstream_transient_error when
+      // every attempt hit it.
+      let streamInternalCount = 0;
       // Dynamic: try every active account in the pool (capped at 10) so a
   // large pool with many rate-limited accounts can still fall through
   // to a free one. Was hardcoded 3 — in pools bigger than 3 with the
@@ -963,12 +1578,14 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
       let accText = '';
       let accThinking = '';
 
-      // Cascade conversation pool (experimental, stream path) — bypassed in
-      // tool-emulation mode because the fingerprint can't collapse turns
-      // whose bodies carry <tool_call>/<tool_result> markup.
-      const reuseEnabled = shouldUseCascadeReuse({ useCascade, emulateTools }) && isExperimentalEnabled('cascadeConversationReuse');
-      const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey) : null;
-      let reuseEntry = reuseEnabled ? poolCheckout(fpBefore) : null;
+      // Cascade conversation pool (stream path). Opus 4.7 tool-emulated
+      // requests opt in even when the global experiment toggle is off, because
+      // replaying full Claude Code history is what triggers context blowups.
+      const reuseEnabled = shouldUseCascadeReuse({ useCascade, emulateTools, modelKey })
+        && (isExperimentalEnabled('cascadeConversationReuse') || shouldForceCascadeReuse({ emulateTools, modelKey }));
+      const strictReuse = shouldUseStrictCascadeReuse({ emulateTools, modelKey });
+      const fpBefore = reuseEnabled ? fingerprintBefore(messages, modelKey, callerKey) : null;
+      let reuseEntry = reuseEnabled ? poolCheckout(fpBefore, callerKey) : null;
       let checkedOutReuseEntry = reuseEntry;
       if (reuseEntry) log.info(`Chat: cascade reuse HIT cascadeId=${reuseEntry.cascadeId.slice(0, 8)}… stream model=${model}`);
 
@@ -1037,18 +1654,32 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
           //              →  client
           let safeText = chunk.text;
           if (toolParser) {
-            const { text: safe, toolCalls: done } = toolParser.feed(chunk.text);
-            safeText = safe;
-            // Only emit tool_call deltas when emulating — otherwise the
-            // parsed calls came from Cascade's built-in tools and are
-            // silently discarded. Sanitize server-internal paths out of
-            // the emulated call's input too (issue #38) — otherwise Claude
-            // Code tries to Read the sandbox path and fails.
-            for (const rawTc of done) {
-              const tc = sanitizeToolCall(rawTc);
-              const idx = collectedToolCalls.length;
-              collectedToolCalls.push(tc);
-              emitToolCallDelta(tc, idx);
+            const parsed = toolParser.feed(chunk.text);
+            safeText = parsed.text;
+            if (Array.isArray(parsed.items) && parsed.items.length) {
+              for (const item of parsed.items) {
+                if (item.type === 'text') {
+                  emitContent(pathStreamText.feed(item.text));
+                  continue;
+                }
+                const tc = sanitizeToolCall(repairToolCallArguments(item.toolCall, messages));
+                const idx = collectedToolCalls.length;
+                collectedToolCalls.push(tc);
+                emitToolCallDelta(tc, idx);
+              }
+              safeText = '';
+            } else {
+              // Only emit tool_call deltas when emulating — otherwise the
+              // parsed calls came from Cascade's built-in tools and are
+              // silently discarded. Sanitize server-internal paths out of
+              // the emulated call's input too (issue #38) — otherwise Claude
+              // Code tries to Read the sandbox path and fails.
+              for (const rawTc of parsed.toolCalls) {
+                const tc = sanitizeToolCall(repairToolCallArguments(rawTc, messages));
+                const idx = collectedToolCalls.length;
+                collectedToolCalls.push(tc);
+                emitToolCallDelta(tc, idx);
+              }
             }
           }
           if (safeText) emitContent(pathStreamText.feed(safeText));
@@ -1080,10 +1711,13 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               }
               if (!acct) {
                 log.info(`Chat[${reqId}]: reuse MISS — owning account not available after 5s wait`);
-                if (CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore) {
+                if (strictReuse && checkedOutReuseEntry && fpBefore) {
                   const availability = getAccountAvailability(checkedOutReuseEntry.apiKey, modelKey);
                   const retryAfterMs = strictReuseRetryMs(availability);
-                  lastErr = new Error(strictReuseMessage(model, retryAfterMs, availability.reason));
+                  lastErr = Object.assign(
+                    new Error(strictReuseMessage(model, retryAfterMs, availability.reason)),
+                    { type: 'rate_limit_exceeded' }
+                  );
                   log.info(`Chat[${reqId}]: strict reuse preserved cascade; owner unavailable reason=${availability.reason}`);
                   break;
                 }
@@ -1092,8 +1726,29 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             }
           }
           if (!acct) {
-            acct = await waitForAccount(tried, abortController.signal, QUEUE_MAX_WAIT_MS, modelKey);
-            if (!acct) break;
+            acct = await waitForAccountFn(tried, abortController.signal, QUEUE_MAX_WAIT_MS, modelKey);
+            if (!acct) {
+              // Without an explicit lastErr here, the final retry-failed log
+              // ends up printing an empty message and the SSE error event
+              // surfaces as a 30s silent stall to the client — issue #77 from
+              // zhangzhang-bit. Diagnose what kept the queue empty so the
+              // operator sees the real cause (rate limit / no entitlement /
+              // upstream stall) instead of guessing.
+              if (!lastErr) {
+                const tempUnavail = isAllTemporarilyUnavailable(modelKey);
+                const rateLimited = isAllRateLimited(modelKey);
+                const reason = tempUnavail.allUnavailable
+                  ? `所有可用账号暂时不可用，请 ${Math.ceil(tempUnavail.retryAfterMs / 1000)} 秒后重试`
+                  : rateLimited.allLimited
+                  ? `所有可用账号均已达速率限制，请 ${Math.ceil(rateLimited.retryAfterMs / 1000)} 秒后重试`
+                  : `${Math.ceil(QUEUE_MAX_WAIT_MS / 1000)} 秒内没有账号变为可用 — 账号可能被速率限制或对当前模型无权限`;
+                lastErr = Object.assign(
+                  new Error(`${model} 账号队列超时: ${reason}`),
+                  { type: (tempUnavail.allUnavailable || rateLimited.allLimited) ? 'rate_limit_exceeded' : 'pool_exhausted' }
+                );
+              }
+              break;
+            }
           }
           tried.push(acct.apiKey);
           currentApiKey = acct.apiKey;
@@ -1103,14 +1758,20 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
           if (isExperimentalEnabled('preflightRateLimit')) {
             try {
               const px = getEffectiveProxy(acct.id) || null;
-              const rl = await checkMessageRateLimit(acct.apiKey, px);
+              const rl = await checkMessageRateLimitFn(acct.apiKey, px);
               if (!rl.hasCapacity) {
                 log.warn(`Preflight: ${acct.email} has no capacity (remaining=${rl.messagesRemaining}), skipping`);
-                markRateLimited(acct.apiKey, 5 * 60 * 1000, modelKey);
-                if (CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
+                refundReservation(acct.apiKey, acct.reservationTimestamp);
+                if (Number.isFinite(rl.retryAfterMs) && rl.retryAfterMs > 0) {
+                  markRateLimited(acct.apiKey, rl.retryAfterMs, modelKey);
+                }
+                if (strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === acct.apiKey) {
                   const availability = getAccountAvailability(acct.apiKey, modelKey);
                   const retryAfterMs = strictReuseRetryMs(availability);
-                  lastErr = new Error(strictReuseMessage(model, retryAfterMs, availability.reason));
+                  lastErr = Object.assign(
+                    new Error(strictReuseMessage(model, retryAfterMs, availability.reason)),
+                    { type: 'rate_limit_exceeded' }
+                  );
                   log.info(`Chat[${reqId}]: strict reuse preserved cascade after preflight rate limit`);
                   break;
                 }
@@ -1155,7 +1816,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
               const tail = toolParser.flush();
               if (tail.text) emitContent(pathStreamText.feed(tail.text));
               for (const rawTc of tail.toolCalls) {
-                const tc = sanitizeToolCall(rawTc);
+                const tc = sanitizeToolCall(repairToolCallArguments(rawTc, messages));
                 const idx = collectedToolCalls.length;
                 collectedToolCalls.push(tc);
                 emitToolCallDelta(tc, idx);
@@ -1164,8 +1825,8 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             emitContent(pathStreamText.flush());
             emitThinking(pathStreamThinking.flush());
             // Pool check-in on success (cascade only)
-            if (reuseEnabled && cascadeResult?.cascadeId && accText) {
-              const fpAfter = fingerprintAfter(messages, modelKey);
+            if (reuseEnabled && cascadeResult?.cascadeId && (accText || collectedToolCalls.length)) {
+              const fpAfter = fingerprintAfter(messages, modelKey, callerKey);
               poolCheckin(fpAfter, {
                 cascadeId: cascadeResult.cascadeId,
                 sessionId: cascadeResult.sessionId,
@@ -1174,7 +1835,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
                 stepOffset: Number.isFinite(cascadeResult.stepOffset) ? cascadeResult.stepOffset : reuseEntry?.stepOffset,
                 generatorOffset: Number.isFinite(cascadeResult.generatorOffset) ? cascadeResult.generatorOffset : reuseEntry?.generatorOffset,
                 createdAt: reuseEntry?.createdAt,
-              });
+              }, callerKey, ttlHintFromCachePolicy(cachePolicy));
             }
             // success
             if (hadSuccess) reportSuccess(currentApiKey);
@@ -1189,7 +1850,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             // any preamble text, returning raw parseable JSON (or the
             // trimmed original when nothing parses).
             if (wantJson && accText) {
-              const cleaned = extractJsonPayload(accText);
+              const cleaned = stabilizeJsonPayload(accText, messages);
               if (cleaned) {
                 send({ id, object: 'chat.completion.chunk', created, model,
                   choices: [{ index: 0, delta: { content: cleaned }, finish_reason: null }] });
@@ -1204,7 +1865,7 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             send({ id, object: 'chat.completion.chunk', created, model,
               choices: [{ index: 0, delta: {}, finish_reason: finalReason }] });
             {
-              const usage = buildUsageBody(cascadeResult?.usage || null, messages, accText, accThinking);
+              const usage = buildUsageBody(cascadeResult?.usage || null, messages, accText, accThinking, cachePolicy);
               send({ id, object: 'chat.completion.chunk', created, model,
                 choices: [], usage });
             }
@@ -1219,20 +1880,29 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             const isAuthFail = /unauthenticated|invalid api key|invalid_grant|permission_denied.*account/i.test(err.message);
             const isRateLimit = /rate limit|rate_limit|too many requests|quota/i.test(err.message);
             const isInternal = /internal error occurred.*error id/i.test(err.message);
+            const isTransport = isCascadeTransportError(err);
+            const isTransient = isUpstreamTransientError(err, isInternal);
             if (isAuthFail) reportError(currentApiKey);
-            if (isRateLimit) { markRateLimited(currentApiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; }
-            if (isInternal) { reportInternalError(currentApiKey); err.isModelError = true; }
-            if (err.isModelError && !isRateLimit && !isInternal) {
+            if (isRateLimit) { markRateLimited(currentApiKey, rateLimitCooldownMs(err.message), modelKey); err.isRateLimit = true; err.isModelError = true; err.kind ||= 'model_error'; }
+            if (isInternal) { reportInternalError(currentApiKey); err.isModelError = true; err.kind ||= 'transient_stall'; }
+            if (isTransport) { err.isModelError = true; err.kind ||= 'transient_stall'; }
+            if (err.isModelError && err.kind !== 'transient_stall' && !isRateLimit && !isInternal) {
               updateCapability(currentApiKey, modelKey, false, 'model_error');
             }
-            if (isRateLimit && CASCADE_REUSE_STRICT && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === currentApiKey) {
+            if (isRateLimit && strictReuse && checkedOutReuseEntry && fpBefore && checkedOutReuseEntry.apiKey === currentApiKey) {
               log.info(`Chat[${reqId}]: strict reuse preserved cascade after rate limit`);
               break;
             }
             // Retry only if nothing has been streamed yet AND it's a retryable error
             if (!hadSuccess && (err.isModelError || isRateLimit)) {
-              const tag = isRateLimit ? 'rate_limit' : isInternal ? 'internal_error' : 'model_error';
-              log.warn(`Account ${acct.email} failed (${tag}) on ${model}, trying next`);
+              const tag = isRateLimit ? 'rate_limit' : isTransient ? 'upstream_transient' : 'model_error';
+              if (isTransient) {
+                streamInternalCount++;
+                const backoffMs = await internalErrorBackoff(streamInternalCount - 1);
+                log.warn(`Chat[${reqId}] stream: ${acct.email} upstream transient error (${isTransport ? 'cascade_transport' : 'internal_error'}), waited ${backoffMs}ms before next account`);
+              } else {
+                log.warn(`Account ${acct.email} failed (${tag}) on ${model}, trying next`);
+              }
               continue;
             }
             break;
@@ -1246,15 +1916,26 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
         }
 
         // All attempts failed
-        log.error('Stream error after retries:', lastErr?.message);
+        log.error('Stream error after retries:', lastErr?.message || String(lastErr || 'account queue timed out without an error object'));
         recordRequest(model, false, Date.now() - startTime, currentApiKey);
         try {
+          const temporaryUnavailable = isAllTemporarilyUnavailable(modelKey);
           const rl = isAllRateLimited(modelKey);
-          const errMsg = rl.allLimited
+          const allInternal = streamInternalCount > 0 && tried.length > 0 && streamInternalCount >= tried.length;
+          // 优先暴露 upstream_transient，避免把 Cascade transport 抖动误报成账号限流。
+          const lastIsTransport = isCascadeTransportError(lastErr);
+          const errMsg = allInternal
+            ? upstreamTransientErrorMessage(model, tried.length, lastIsTransport ? 'cascade_transport' : 'internal_error')
+            : temporaryUnavailable.allUnavailable
+            ? `${model} 所有账号暂时不可用，请 ${Math.ceil(temporaryUnavailable.retryAfterMs / 1000)} 秒后重试`
+            : rl.allLimited
             ? `${model} 所有账号均已达速率限制，请 ${Math.ceil(rl.retryAfterMs / 1000)} 秒后重试`
             : sanitizeText(lastErr?.message || 'no accounts');
+          if (allInternal) {
+            log.error(`Chat[${reqId}] stream: ${tried.length}/${tried.length} accounts hit upstream transient error — surfacing upstream_transient_error`);
+          }
           if (!hadSuccess && checkedOutReuseEntry && fpBefore) {
-            poolCheckin(fpBefore, checkedOutReuseEntry);
+            poolCheckin(fpBefore, checkedOutReuseEntry, callerKey, ttlHintFromCachePolicy(cachePolicy));
             log.info(`Chat[${reqId}]: restored checked-out cascade after failed stream`);
           }
 
@@ -1265,21 +1946,26 @@ function streamResponse(id, created, model, modelKey, messages, cascadeMessages,
             // output). Close cleanly with a plain stop — the caller saw
             // whatever partial content we produced. Error details only
             // go to the server log.
-            send({ id, object: 'chat.completion.chunk', created, model,
-              choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] });
+            const errType = allInternal
+              ? 'upstream_transient_error'
+              : (temporaryUnavailable.allUnavailable || lastErr?.type === 'rate_limit_exceeded')
+                ? 'rate_limit_exceeded'
+                : 'upstream_error';
+            send(chatStreamError(errMsg, errType));
             log.warn(`Stream: partial response delivered then failed (${errMsg})`);
           } else {
-            if (!rolePrinted) {
-              send({ id, object: 'chat.completion.chunk', created, model,
-                choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] });
-            }
-            send({ id, object: 'chat.completion.chunk', created, model,
-              choices: [{ index: 0, delta: { content: `\n[Error: ${errMsg}]` }, finish_reason: 'stop' }] });
+            const errType = allInternal
+              ? 'upstream_transient_error'
+              : (temporaryUnavailable.allUnavailable || lastErr?.type === 'rate_limit_exceeded')
+                ? 'rate_limit_exceeded'
+                : 'upstream_error';
+            send(chatStreamError(errMsg, errType));
           }
           res.write('data: [DONE]\n\n');
         } catch {}
         if (!res.writableEnded) res.end();
       } finally {
+        unregisterSse();
         stopHeartbeat();
       }
     },

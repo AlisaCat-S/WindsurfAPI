@@ -11,7 +11,7 @@
  * No buffering, so first-token latency matches the upstream Cascade stream.
  */
 
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { handleChatCompletions } from './chat.js';
 import { log } from '../config.js';
 
@@ -19,10 +19,109 @@ function genMsgId() {
   return 'msg_' + randomUUID().replace(/-/g, '').slice(0, 24);
 }
 
+// Anthropic Messages API tool types whose execution lives on Anthropic's
+// servers, not the client. The proxy treats these as opt-out: it cannot
+// satisfy server_tool_result delivery without implementing each one
+// against Cascade, so they're stripped from the request rather than
+// translated into normal function tools.
+//   web_search_20250305     server-side web search
+//   code_execution_20250522 server-side python sandbox
+//   advisor_20260301        Anthropic Advisor Strategy (sonnet+opus pair)
+const SERVER_SIDE_ANTHROPIC_TOOL_TYPES = new Set([
+  'web_search_20250305',
+  'code_execution_20250522',
+  'advisor_20260301',
+]);
+
+function sha256Hex(value) {
+  return createHash('sha256').update(String(value || '')).digest('hex');
+}
+
+// Real Claude Code 2.1.120 traffic carries metadata.user_id as a
+// JSON-encoded string with shape {device_id, account_uuid, session_id}.
+// Older Anthropic SDK clients send a plain string. The proxy currently
+// derives callerKey from API key + IP/UA, which means every Claude Code
+// client behind the same key shares one cascade pool — leading to cross-
+// device session bleed. Extract a stable per-user tag from metadata so
+// the pool can isolate concurrent users.
+export function extractCallerSubKey(body) {
+  const userId = body?.metadata?.user_id;
+  if (typeof userId !== 'string' || !userId) return '';
+  let parsed = null;
+  try { parsed = JSON.parse(userId); } catch {}
+  let tag = '';
+  if (parsed && typeof parsed === 'object') {
+    tag = parsed.device_id || parsed.deviceId
+      || parsed.session_id || parsed.sessionId
+      || parsed.account_uuid || parsed.accountUuid
+      || '';
+  } else {
+    tag = userId;
+  }
+  if (!tag) return '';
+  return sha256Hex(tag).slice(0, 16);
+}
+
+// Anthropic prompt caching (`cache_control`) — verified spec:
+//   - shape: { type: 'ephemeral', ttl?: '5m' | '1h' }, default ttl 5m
+//   - placeable on tools[], system[] blocks, messages[].content[] blocks
+//   - prefix-cumulative, ordered tools → system → messages
+//   - max 4 breakpoints per request
+//
+// Cascade upstream doesn't speak this dialect — its own caching layer
+// reports cacheReadTokens/cacheWriteTokens that already flow through
+// chat.js → openAIToAnthropic. We strip the markers before forwarding
+// (so they don't leak into Cascade requests) and expose a policy
+// summary for downstream stages: TTL hint for the conversation pool,
+// 5m vs 1h split attribution in usage.cache_creation.
+//
+// Returns: { has1h, breakpointCount } describing the request.
+function extractCachePolicy(body) {
+  let breakpointCount = 0;
+  let has1h = false;
+  const visit = (block) => {
+    if (!block || typeof block !== 'object') return;
+    const cc = block.cache_control;
+    if (cc && typeof cc === 'object' && cc.type === 'ephemeral') {
+      breakpointCount++;
+      if (cc.ttl === '1h') has1h = true;
+      delete block.cache_control;
+    }
+  };
+  if (Array.isArray(body.tools)) for (const t of body.tools) visit(t);
+  if (Array.isArray(body.system)) for (const s of body.system) visit(s);
+  if (Array.isArray(body.messages)) {
+    for (const m of body.messages) {
+      if (Array.isArray(m.content)) for (const c of m.content) visit(c);
+    }
+  }
+  // Also accept top-level cache_control hint (auto-caching mode).
+  if (body.cache_control && typeof body.cache_control === 'object') {
+    if (body.cache_control.type === 'ephemeral') {
+      breakpointCount++;
+      if (body.cache_control.ttl === '1h') has1h = true;
+    }
+    delete body.cache_control;
+  }
+  return { has1h, breakpointCount };
+}
+
 // ─── Anthropic → OpenAI request translation ──────────────────
 
 function anthropicToOpenAI(body) {
+  const cachePolicy = extractCachePolicy(body);
+  const mapAnthropicToolChoice = (toolChoice) => {
+    if (!toolChoice || typeof toolChoice !== 'object') return toolChoice;
+    if (toolChoice.type === 'auto') return 'auto';
+    if (toolChoice.type === 'any') return 'required';
+    if (toolChoice.type === 'none') return 'none';
+    if (toolChoice.type === 'tool' && toolChoice.name) {
+      return { type: 'function', function: { name: toolChoice.name } };
+    }
+    return toolChoice;
+  };
   const messages = [];
+  const toolNameById = new Map();
   if (body.system) {
     const sysText = typeof body.system === 'string'
       ? body.system
@@ -48,17 +147,23 @@ function anthropicToOpenAI(body) {
         } else if (block.type === 'thinking') {
           // Thinking blocks from assistant history — skip; the model will regenerate
         } else if (block.type === 'tool_use' && role === 'assistant') {
+          const id = block.id || `call_${randomUUID().slice(0, 8)}`;
+          toolNameById.set(id, block.name || '');
           toolCalls.push({
-            id: block.id || `call_${randomUUID().slice(0, 8)}`,
+            id,
             type: 'function',
             function: { name: block.name, arguments: JSON.stringify(block.input || {}) },
           });
         } else if (block.type === 'tool_result') {
-          const content = typeof block.content === 'string'
+          let content = typeof block.content === 'string'
             ? block.content
             : Array.isArray(block.content)
               ? block.content.map(b => b.text || '').join('\n')
               : JSON.stringify(block.content);
+          content = annotateRiskyReadToolResult(content, {
+            toolName: toolNameById.get(block.tool_use_id),
+            isError: !!block.is_error,
+          });
           toolResults.push({ role: 'tool', tool_call_id: block.tool_use_id, content });
         }
       }
@@ -78,14 +183,55 @@ function anthropicToOpenAI(body) {
       for (const tr of toolResults) messages.push(tr);
     }
   }
-  const tools = (body.tools || []).map(t => ({
-    type: 'function',
-    function: {
-      name: t.name,
-      description: t.description || '',
-      parameters: t.input_schema || {},
-    },
-  }));
+  // Anthropic exposes a growing set of "server-side" tool types where
+  // the service itself runs the work and the client only opts in via
+  // type. The proxy can't honor any of these (each needs its own stage-2
+  // implementation - Cascade-side opus advisor pass, web-search bridge,
+  // sandbox code exec). Drop them silently from the OpenAI-shaped tools
+  // forwarded upstream; otherwise the upstream model is free to invent
+  // a normal function tool_use for "advisor" the client will never get
+  // a server_tool_result for.
+  const droppedServerTools = [];
+  const tools = (body.tools || []).reduce((acc, t) => {
+    if (t?.type && SERVER_SIDE_ANTHROPIC_TOOL_TYPES.has(t.type)) {
+      droppedServerTools.push(t.type);
+      return acc;
+    }
+    acc.push({
+      type: 'function',
+      function: {
+        name: t.name,
+        description: t.description || '',
+        parameters: t.input_schema || {},
+      },
+    });
+    return acc;
+  }, []);
+  if (droppedServerTools.length) {
+    log.info(`messages: dropped ${droppedServerTools.length} server-side tool(s) [${[...new Set(droppedServerTools)].join(',')}] - proxy does not implement them yet`);
+  }
+  // Claude Code 2.x and Anthropic SDK clients send response shape and
+  // reasoning controls inside body.output_config — output_config.effort
+  // mirrors OpenAI's reasoning_effort, and output_config.format carries
+  // structured-output schemas Anthropic-side instead of OpenAI's
+  // response_format. The internal handler speaks OpenAI dialect, so
+  // unwrap both here so chat.js sees them on the path it already knows.
+  const oc = body.output_config;
+  const ocEffort = oc?.effort;
+  const ocFormat = oc?.format;
+  let translatedResponseFormat = null;
+  if (ocFormat?.type === 'json_schema' && ocFormat.schema) {
+    translatedResponseFormat = {
+      type: 'json_schema',
+      json_schema: {
+        name: ocFormat.name || 'response',
+        schema: ocFormat.schema,
+        strict: ocFormat.strict !== false,
+      },
+    };
+  } else if (ocFormat?.type === 'json_object') {
+    translatedResponseFormat = { type: 'json_object' };
+  }
   return {
     model: body.model || 'claude-sonnet-4.6',
     messages,
@@ -95,7 +241,36 @@ function anthropicToOpenAI(body) {
     ...(body.temperature != null ? { temperature: body.temperature } : {}),
     ...(body.top_p != null ? { top_p: body.top_p } : {}),
     ...(body.stop_sequences ? { stop: body.stop_sequences } : {}),
+    ...(body.tool_choice ? { tool_choice: mapAnthropicToolChoice(body.tool_choice) } : {}),
+    ...(body.thinking ? { thinking: body.thinking } : {}),
+    ...(ocEffort ? { reasoning_effort: ocEffort } : {}),
+    ...(translatedResponseFormat ? { response_format: translatedResponseFormat } : {}),
+    ...(cachePolicy.breakpointCount > 0 ? { __cachePolicy: cachePolicy } : {}),
   };
+}
+
+export { extractCachePolicy };
+
+export function annotateRiskyReadToolResult(content, { toolName = '', isError = false } = {}) {
+  if (toolName !== 'Read' || typeof content !== 'string' || !content) return content;
+  const lower = content.toLowerCase();
+  const isOversizeNoContent = isError
+    && /file content \([^)]+\) exceeds maximum allowed size/i.test(content)
+    && /use offset and limit parameters/i.test(content);
+  // Claude Code Read tool emits real file bodies in "<lineno>\t<line>" form.
+  // Stub strings (cached/unchanged/truncated) never use that prefix, so the
+  // presence of a line-numbered line means we're looking at actual content
+  // and keyword heuristics would only false-positive on user code/comments.
+  const looksLikeRealBody = /^\s*\d+\t/m.test(content);
+  const isCachedStub = !looksLikeRealBody && (
+    /(?:file )?(?:content )?(?:unchanged|cached)/i.test(content)
+    || /(?:内容未变更|已缓存)/.test(content)
+  ) && content.length < 2000;
+  const mentionsTruncation = !looksLikeRealBody
+    && /truncated|截断|丢失/.test(lower);
+  if (!isOversizeNoContent && !isCachedStub && !mentionsTruncation) return content;
+
+  return `${content}\n\n[WindsurfAPI note: This Read result does not prove the full file body is available in the current conversation. If the task depends on full file contents, use Read with offset/limit or another content-bearing tool result before returning PASS.]`;
 }
 
 // ─── OpenAI → Anthropic non-stream response translation ──────
@@ -131,12 +306,35 @@ function openAIToAnthropic(result, model, msgId) {
     model: model || result.model,
     stop_reason: stopMap[choice?.finish_reason] || 'end_turn',
     stop_sequence: null,
-    usage: {
-      input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
-      output_tokens: usage.completion_tokens || usage.output_tokens || 0,
-      cache_creation_input_tokens: usage.cache_creation_input_tokens || 0,
-      cache_read_input_tokens: usage.prompt_tokens_details?.cached_tokens || 0,
-    },
+    usage: buildAnthropicUsage(usage),
+  };
+}
+
+// Anthropic's prompt-caching usage shape carries BOTH the legacy flat
+// fields (cache_creation_input_tokens, cache_read_input_tokens) AND the
+// newer nested split (cache_creation: { ephemeral_5m_input_tokens,
+// ephemeral_1h_input_tokens }, GA since 2025-08-18). Emit both so SDK
+// callers on either schema see consistent numbers — the flat total
+// equals ephemeral_5m + ephemeral_1h. When chat.js doesn't supply a
+// split (no cache_control on the request) we attribute the whole
+// creation count to the 5m bucket since that's the spec default.
+function buildAnthropicUsage(usage) {
+  const cacheRead = usage.cache_read_input_tokens
+    ?? usage.prompt_tokens_details?.cached_tokens
+    ?? 0;
+  const cacheCreationFlat = usage.cache_creation_input_tokens || 0;
+  const split = usage.cache_creation && typeof usage.cache_creation === 'object'
+    ? {
+        ephemeral_5m_input_tokens: usage.cache_creation.ephemeral_5m_input_tokens || 0,
+        ephemeral_1h_input_tokens: usage.cache_creation.ephemeral_1h_input_tokens || 0,
+      }
+    : { ephemeral_5m_input_tokens: cacheCreationFlat, ephemeral_1h_input_tokens: 0 };
+  return {
+    input_tokens: usage.prompt_tokens || usage.input_tokens || 0,
+    output_tokens: usage.completion_tokens || usage.output_tokens || 0,
+    cache_creation_input_tokens: cacheCreationFlat,
+    cache_read_input_tokens: cacheRead,
+    cache_creation: split,
   };
 }
 
@@ -178,7 +376,13 @@ class AnthropicStreamTranslator {
         model: this.model,
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 },
+        },
       },
     });
   }
@@ -248,6 +452,10 @@ class AnthropicStreamTranslator {
   }
 
   processChunk(chunk) {
+    if (chunk.error) {
+      this.error(chunk.error);
+      return;
+    }
     this.startMessage();
     const choice = chunk.choices?.[0];
     if (choice) {
@@ -273,14 +481,22 @@ class AnthropicStreamTranslator {
     this.send('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: this.stopReason, stop_sequence: null },
-      usage: {
-        input_tokens: u.prompt_tokens || u.input_tokens || 0,
-        output_tokens: u.completion_tokens || u.output_tokens || 0,
-        cache_creation_input_tokens: u.cache_creation_input_tokens || 0,
-        cache_read_input_tokens: u.prompt_tokens_details?.cached_tokens || 0,
-      },
+      usage: buildAnthropicUsage(u),
     });
     this.send('message_stop', { type: 'message_stop' });
+  }
+
+  error(err) {
+    if (this.messageStopped) return;
+    this.messageStopped = true;
+    this.closeCurrentBlock();
+    this.send('error', {
+      type: 'error',
+      error: {
+        type: err?.type || 'api_error',
+        message: err?.message || 'Upstream stream error',
+      },
+    });
   }
 
   // SSE parser — handleChatCompletions writes `data: {...}\n\n` frames;
@@ -370,14 +586,23 @@ function createCaptureRes(translator, realRes) {
 
 // ─── Main entry ───────────────────────────────────────────────
 
-export async function handleMessages(body) {
+export async function handleMessages(body, context = {}) {
   const msgId = genMsgId();
   const requestedModel = body.model || 'claude-sonnet-4.6';
   const wantStream = !!body.stream;
   const openaiBody = anthropicToOpenAI(body);
+  const chatHandler = context.handleChatCompletions || handleChatCompletions;
+  // Augment callerKey with the per-user tag from metadata.user_id when
+  // present so the cascade pool can isolate concurrent Claude Code users
+  // sharing one API key. Bare API-key callers and other client SDKs that
+  // do not send metadata.user_id keep the original callerKey unchanged.
+  const subKey = extractCallerSubKey(body);
+  const effectiveContext = subKey
+    ? { ...context, callerKey: `${context.callerKey || ''}:user:${subKey}` }
+    : context;
 
   if (!wantStream) {
-    const result = await handleChatCompletions({ ...openaiBody, stream: false });
+    const result = await chatHandler({ ...openaiBody, stream: false }, effectiveContext);
     if (result.status !== 200) {
       return {
         status: result.status,
@@ -396,7 +621,7 @@ export async function handleMessages(body) {
   // Streaming path — ask handleChatCompletions for its streaming handler and
   // point its writes at our translator shim. This lets the upstream Cascade
   // poll loop drive the downstream SSE in real time — no buffer-then-replay.
-  const streamResult = await handleChatCompletions({ ...openaiBody, stream: true });
+  const streamResult = await chatHandler({ ...openaiBody, stream: true }, effectiveContext);
 
   if (!streamResult.stream) {
     // The OpenAI path returned a non-stream error (e.g. 403 model_not_entitled)
@@ -436,10 +661,7 @@ export async function handleMessages(body) {
         await streamResult.handler(captureRes);
       } catch (e) {
         log.error(`Messages stream error: ${e.message}`);
-        if (!translator.messageStarted) {
-          translator.startMessage();
-        }
-        translator.finish();
+        translator.error({ type: 'api_error', message: e.message });
       }
 
       if (!realRes.writableEnded) realRes.end();

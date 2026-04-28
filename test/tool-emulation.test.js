@@ -1,9 +1,12 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { repairToolCallArguments } from '../src/handlers/chat.js';
 import {
   ToolCallStreamParser,
   parseToolCallsFromText,
   buildToolPreamble,
+  buildToolPreambleForProto,
+  buildCompactToolPreambleForProto,
   normalizeMessagesForCascade,
 } from '../src/handlers/tool-emulation.js';
 
@@ -52,6 +55,26 @@ describe('ToolCallStreamParser', () => {
     assert.ok(text.includes('Before'));
     assert.ok(text.includes('After'));
     assert.ok(!text.includes('<tool_call>'));
+  });
+
+  it('preserves text/tool order in items within one chunk', () => {
+    const parser = new ToolCallStreamParser();
+    const r = parser.feed('A<tool_call>{"name":"Read","arguments":{"path":"x"}}</tool_call>B');
+    assert.deepEqual(r.items, [
+      { type: 'text', text: 'A' },
+      {
+        type: 'tool_call',
+        toolCall: {
+          id: r.toolCalls[0].id,
+          name: 'Read',
+          argumentsJson: '{"path":"x"}',
+        },
+      },
+      { type: 'text', text: 'B' },
+    ]);
+    assert.equal(r.text, 'AB');
+    assert.equal(r.toolCalls.length, 1);
+    assert.equal(r.toolCalls[0].name, 'Read');
   });
 
   it('handles multiple tool calls in one chunk', () => {
@@ -121,7 +144,7 @@ describe('buildToolPreamble (injection-guard safety)', () => {
     // No fenced ```json blocks (schemas would live inside these)
     assert.ok(!/```json/i.test(preamble), 'preamble must not contain fenced json schema blocks');
     // Stays well under a "system prompt wall of text" size even with many tools
-    assert.ok(preamble.length < 512, `preamble must stay compact (<512 chars); got ${preamble.length}`);
+    assert.ok(preamble.length < 640, `preamble must stay compact (<640 chars); got ${preamble.length}`);
   });
 
   it('still describes the <tool_call> protocol and lists every tool name', () => {
@@ -129,6 +152,8 @@ describe('buildToolPreamble (injection-guard safety)', () => {
     for (const t of manyTools) {
       assert.ok(preamble.includes(t.function.name), `must include function name ${t.function.name}`);
     }
+    assert.ok(preamble.includes('arguments.command'), 'must carry the short Bash argument hint');
+    assert.ok(preamble.includes('arguments.file_path'), 'must carry the short Read argument hint');
   });
 
   it('normalizeMessagesForCascade prepends preamble to last user message without jailbreak or system-prompt shape', () => {
@@ -149,6 +174,113 @@ describe('buildToolPreamble (injection-guard safety)', () => {
     assert.equal(buildToolPreamble([]), '');
     assert.equal(buildToolPreamble([{ type: 'other' }]), '');
     assert.equal(buildToolPreamble([{ type: 'function' }]), '');
+  });
+
+  it('adds Bash and Read argument fidelity rules only to the proto preamble', () => {
+    const full = buildToolPreambleForProto(manyTools, 'auto');
+    assert.match(full, /Tool argument fidelity rules:/);
+    assert.match(full, /Bash: arguments MUST include the full command string/);
+    assert.match(full, /Preserve quotes, flags, pipes, redirections/);
+    assert.match(full, /Read: use "file_path" exactly/);
+    assert.ok(!preamble.includes('Tool argument fidelity rules:'),
+      'user-message fallback must not include the long proto-only rule block');
+    assert.ok(preamble.includes('arguments.command'),
+      'user-message fallback should include the compact Bash argument hint');
+  });
+});
+
+describe('buildCompactToolPreambleForProto (payload budget fallback)', () => {
+  // Issue #67-adjacent: Claude Code can ship 30+ tools, each with multi-KB
+  // parameter schemas. The full proto-level preamble was being doubled into
+  // both field 12 and field 10 of CascadeConversationalPlannerConfig and
+  // pushing total LS panel state past ~30KB, causing tools to silently fail
+  // when deployed to cloud. The compact path keeps the protocol contract
+  // and tool names but drops every parameter schema.
+  const bigTools = Array.from({ length: 30 }, (_, i) => ({
+    type: 'function',
+    function: {
+      name: `tool_${i}`,
+      description: `Description for tool ${i} that goes on for a while to bulk up the schema.`,
+      parameters: {
+        type: 'object',
+        properties: Object.fromEntries(
+          Array.from({ length: 15 }, (_, j) => [`param_${j}`, {
+            type: 'string',
+            description: `Parameter ${j} of tool ${i}, with verbose explanation that runs long.`,
+            enum: ['option_a', 'option_b', 'option_c', 'option_d', 'option_e'],
+          }])
+        ),
+        required: Array.from({ length: 15 }, (_, j) => `param_${j}`),
+      },
+    },
+  }));
+
+  it('compact form is dramatically smaller than full schemas', () => {
+    const full = buildToolPreambleForProto(bigTools, 'auto');
+    const compact = buildCompactToolPreambleForProto(bigTools, 'auto');
+    assert.ok(full.length > 20000, `expected full to be heavy, got ${full.length}B`);
+    assert.ok(compact.length < 2000, `compact must be tiny, got ${compact.length}B`);
+    assert.ok(compact.length < full.length / 5, 'compact must be at least 5x smaller');
+  });
+
+  it('compact form still names every tool and describes the protocol', () => {
+    const compact = buildCompactToolPreambleForProto(bigTools, 'auto');
+    for (let i = 0; i < bigTools.length; i++) {
+      assert.ok(compact.includes(`tool_${i}`), `must mention tool_${i}`);
+    }
+    assert.ok(compact.includes('<tool_call>'), 'must describe emission format');
+  });
+
+  it('compact form omits parameter schemas entirely', () => {
+    const compact = buildCompactToolPreambleForProto(bigTools, 'auto');
+    assert.ok(!compact.includes('param_0'), 'must NOT include parameter names');
+    assert.ok(!compact.includes('option_a'), 'must NOT include enum values');
+    assert.ok(!compact.includes('```json'), 'must NOT include JSON schema fences');
+  });
+
+  it('compact form preserves environment block when provided', () => {
+    const compact = buildCompactToolPreambleForProto(
+      bigTools, 'auto',
+      '- Working directory: /home/user/project\n- Platform: linux'
+    );
+    assert.ok(compact.includes('Environment facts'));
+    assert.ok(compact.includes('/home/user/project'));
+  });
+
+  it('compact form respects tool_choice=required', () => {
+    const compact = buildCompactToolPreambleForProto(bigTools, 'required');
+    assert.ok(compact.includes('You MUST call at least one function'));
+  });
+
+  it('compact form returns empty for no tools', () => {
+    assert.equal(buildCompactToolPreambleForProto([], 'auto'), '');
+    assert.equal(buildCompactToolPreambleForProto(null, 'auto'), '');
+    assert.equal(buildCompactToolPreambleForProto([{ type: 'function' }], 'auto'), '');
+  });
+
+  it('compact form does not contain jailbreak phrasing', () => {
+    const compact = buildCompactToolPreambleForProto(bigTools, 'auto');
+    const banned = [
+      /IGNORE any earlier/i,
+      /ignore previous instructions/i,
+      /for this request only/i,
+      /\[Tool-calling context/i,
+    ];
+    for (const re of banned) {
+      assert.ok(!re.test(compact), `compact preamble must not match ${re}`);
+    }
+  });
+
+  it('compact form keeps known-tool argument fidelity rules even without schemas', () => {
+    const tools = [
+      { type: 'function', function: { name: 'Bash', description: 'Run shell', parameters: { type: 'object', properties: { command: { type: 'string' } } } } },
+      { type: 'function', function: { name: 'Read', description: 'Read file', parameters: { type: 'object', properties: { file_path: { type: 'string' } } } } },
+    ];
+    const compact = buildCompactToolPreambleForProto(tools, 'auto');
+    assert.match(compact, /Tool argument fidelity rules:/);
+    assert.match(compact, /Bash: arguments MUST include the full command string/);
+    assert.match(compact, /Read: use "file_path" exactly/);
+    assert.ok(!compact.includes('"properties"'), 'compact form must still avoid full schemas');
   });
 });
 
@@ -221,5 +353,71 @@ describe('normalizeMessagesForCascade (preamble placement regression)', () => {
     assert.ok(last.content.startsWith('Tools available this turn:'),
       'latest real user turn must receive the preamble');
     assert.ok(last.content.endsWith('follow-up question'));
+  });
+
+  it('preserves multimodal user content when adding the fallback preamble', () => {
+    const imageData = 'a'.repeat(200);
+    const out = normalizeMessagesForCascade(
+      [{ role: 'user', content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
+        { type: 'text', text: '解释这张图' },
+      ] }],
+      tools,
+    );
+    assert.equal(out.length, 1);
+    assert.ok(Array.isArray(out[0].content), 'multimodal content must stay as content blocks');
+    assert.equal(out[0].content[0].type, 'text');
+    assert.ok(out[0].content[0].text.startsWith('Tools available this turn:'));
+    assert.equal(out[0].content[1].type, 'image');
+    const injectedText = out[0].content
+      .filter(p => p?.type === 'text')
+      .map(p => p.text)
+      .join('\n');
+    assert.ok(!injectedText.includes(imageData), 'base64 must not be copied into text blocks');
+  });
+
+  it('can disable user-message fallback for Opus 4.7 multimodal turns', () => {
+    const image = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'b'.repeat(200) } };
+    const out = normalizeMessagesForCascade(
+      [{ role: 'user', content: [image, { type: 'text', text: 'what is this?' }] }],
+      tools,
+      { injectUserPreamble: false },
+    );
+    assert.ok(Array.isArray(out[0].content));
+    assert.deepEqual(out[0].content[0], image);
+    assert.equal(out[0].content[1].text, 'what is this?');
+  });
+});
+
+describe('repairToolCallArguments', () => {
+  it('repairs Bash command prefix truncation when the user gave an exact command', () => {
+    const tc = {
+      name: 'Bash',
+      argumentsJson: JSON.stringify({ command: 'node -p' }),
+    };
+    const repaired = repairToolCallArguments(tc, [
+      {
+        role: 'user',
+        content: 'Tool 2: Bash with command exactly node -p "require(\'./package.json\').version".',
+      },
+    ]);
+    assert.equal(
+      JSON.parse(repaired.argumentsJson).command,
+      'node -p "require(\'./package.json\').version"'
+    );
+  });
+
+  it('does not invent Bash arguments when the model command is not a prefix', () => {
+    const tc = {
+      name: 'Bash',
+      argumentsJson: JSON.stringify({ command: 'npm test' }),
+    };
+    const repaired = repairToolCallArguments(tc, [
+      {
+        role: 'user',
+        content: 'Run exactly node -p "require(\'./package.json\').version".',
+      },
+    ]);
+    assert.equal(JSON.parse(repaired.argumentsJson).command, 'npm test');
   });
 });

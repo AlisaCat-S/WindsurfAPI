@@ -9,13 +9,16 @@
  */
 
 import { randomUUID } from 'crypto';
-import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, renameSync, unlinkSync, readdirSync } from 'fs';
 import { config, log } from './config.js';
 import { getEffectiveProxy } from './dashboard/proxy-config.js';
 import { getTierModels, getModelKeysByEnum, MODELS, registerDiscoveredFreeModel } from './models.js';
 
 import { join } from 'path';
-const ACCOUNTS_FILE = join(config.dataDir, 'accounts.json');
+// accounts.json lives in the cluster-shared dir so add-account writes from
+// one replica survive future restarts and are visible to every replica.
+// See `src/config.js` (sharedDataDir vs dataDir) and issue #67.
+const ACCOUNTS_FILE = join(config.sharedDataDir || config.dataDir, 'accounts.json');
 
 // ─── Account pool ──────────────────────────────────────────
 
@@ -26,6 +29,27 @@ let _roundRobinIndex = 0;
 // weighted selection (accounts with more headroom are preferred).
 const TIER_RPM = { pro: 60, free: 10, unknown: 20, expired: 0 };
 const RPM_WINDOW_MS = 60 * 1000;
+
+// Monotonic per-process counter so two reservations landing in the same
+// millisecond produce distinct `_rpmHistory` tokens. Without this,
+// `refundReservation()` could remove the wrong reservation under
+// concurrent traffic. The fractional offset stays well below 1ms so
+// numerical comparisons against ms-based cutoffs still work as expected.
+let reservationSeq = 0;
+function nextReservationToken(now) {
+  reservationSeq = (reservationSeq + 1) % 1000;
+  return now + reservationSeq / 1000;
+}
+
+// Strict positive int env reader (mirrors the helper in client.js /
+// conversation-pool.js). Used by the dynamic cloud probe path below; when
+// this was missing the probe path crashed with "positiveIntEnv is not
+// defined" on every refresh cycle and free-account model discovery
+// silently stopped working.
+function positiveIntEnv(name, fallback) {
+  const n = parseInt(process.env[name] || '', 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 
 function rpmLimitFor(account) {
   return TIER_RPM[account.tier || 'unknown'] ?? 20;
@@ -98,8 +122,59 @@ export function saveAccountsSync() {
   }
 }
 
+// Issue #67 — accounts.json used to live under `dataDir` which became
+// per-replica when REPLICA_ISOLATE=1 shipped (commit 35700bb). Each
+// docker-compose upgrade gets a fresh container HOSTNAME so the previous
+// run's accounts ended up orphaned under a stale `replica-<old>/` subdir.
+// On startup, if the shared accounts.json is missing but one or more
+// replica-local copies exist, union them by apiKey and write into the
+// shared path. Survives multiple stale subdirs across upgrade cycles.
+//
+// Pure-function form is exported so tests can drive it without booting
+// the whole auth module against a real config.
+export function migrateReplicaAccountsTo({ sharedDir, accountsFile, logger = log }) {
+  if (existsSync(accountsFile)) return { migrated: 0, scanned: 0, skipped: true };
+  let entries;
+  try {
+    entries = readdirSync(sharedDir).filter(n => n.startsWith('replica-'));
+  } catch { return { migrated: 0, scanned: 0, skipped: true }; }
+  if (!entries.length) return { migrated: 0, scanned: 0, skipped: true };
+  const merged = new Map();
+  let scanned = 0;
+  for (const entry of entries) {
+    const legacyPath = join(sharedDir, entry, 'accounts.json');
+    if (!existsSync(legacyPath)) continue;
+    scanned++;
+    try {
+      const data = JSON.parse(readFileSync(legacyPath, 'utf-8'));
+      if (!Array.isArray(data)) continue;
+      for (const a of data) {
+        if (a?.apiKey && !merged.has(a.apiKey)) merged.set(a.apiKey, a);
+      }
+    } catch (e) {
+      logger.warn?.(`Account migration: skipped ${legacyPath}: ${e.message}`);
+    }
+  }
+  if (!merged.size) return { migrated: 0, scanned, skipped: false };
+  const tempFile = accountsFile + '.migrate.tmp';
+  try {
+    writeFileSync(tempFile, JSON.stringify([...merged.values()], null, 2));
+    renameSync(tempFile, accountsFile);
+    logger.warn?.(`Migrated ${merged.size} account(s) from ${scanned} replica-* subdir(s) into ${accountsFile} (issue #67)`);
+    return { migrated: merged.size, scanned, skipped: false };
+  } catch (e) {
+    logger.error?.(`Account migration write failed: ${e.message}`);
+    try { unlinkSync(tempFile); } catch {}
+    return { migrated: 0, scanned, skipped: false, error: e.message };
+  }
+}
+
 function loadAccounts() {
   try {
+    migrateReplicaAccountsTo({
+      sharedDir: config.sharedDataDir || config.dataDir,
+      accountsFile: ACCOUNTS_FILE,
+    });
     if (!existsSync(ACCOUNTS_FILE)) return;
     const data = JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf-8'));
     for (const a of data) {
@@ -247,22 +322,62 @@ export function setAccountBlockedModels(id, blockedModels) {
 }
 
 /**
- * Resolve whether `modelKey` is callable on this account:
- *   tier entitlement ∩ (models.js catalog) − account.blockedModels
+ * Resolve whether `modelKey` is callable on this account.
+ *
+ * Two-stage decision:
+ *   1. blocklist always wins (manual operator override)
+ *   2. if GetUserStatus has filled `capabilities[key].reason='user_status'`
+ *      that's the upstream-authoritative answer (cascade_allowed_models_config)
+ *      — trust it directly, regardless of static tier table
+ *   3. otherwise fall back to the tier static allowlist (UID-only models,
+ *      pre-status accounts, unknown tier)
+ *
+ * Without step 2, free accounts that Windsurf actually entitles to
+ * GLM/SWE/Kimi via the upstream allowlist still route through the
+ * `MODEL_TIER_ACCESS.free` static table (gemini-only) and get denied
+ * at selector time even though `account.capabilities` already says yes.
  */
 export function isModelAllowedForAccount(account, modelKey) {
-  const tierModels = getTierModels(account.tier || 'unknown');
-  if (!tierModels.includes(modelKey)) return false;
   const blocked = account.blockedModels || [];
   if (blocked.includes(modelKey)) return false;
-  return true;
+  // tierManual is the operator escape hatch: when set, trust the manual
+  // tier table over GetUserStatus's per-account allowlist. Useful when
+  // probe-based detection misclassified a Pro/Trial account as free
+  // (issue #8) and the operator manually flips it back to Pro.
+  if (!account.tierManual) {
+    // GetUserStatus writes both arms — `user_status` for allowed and
+    // `not_entitled` for denied — into capabilities, keyed by enum.
+    // Either reason means the upstream allowlist has already spoken.
+    const cap = account.capabilities?.[modelKey];
+    if (cap?.reason === 'user_status' || cap?.reason === 'not_entitled') {
+      return cap.ok === true;
+    }
+  }
+  const tierModels = getTierModels(account.tier || 'unknown');
+  return tierModels.includes(modelKey);
 }
 
 /** List of model keys this account is currently allowed to call. */
 export function getAvailableModelsForAccount(account) {
-  const tierModels = getTierModels(account.tier || 'unknown');
   const blocked = new Set(account.blockedModels || []);
-  return tierModels.filter(m => !blocked.has(m));
+  const tierModels = getTierModels(account.tier || 'unknown');
+  // Manual tier override or no GetUserStatus yet → tier static table.
+  if (account.tierManual || !account.userStatusLastFetched || !account.capabilities) {
+    return tierModels.filter(m => !blocked.has(m));
+  }
+  // After GetUserStatus: per-account allowlist is authoritative for every
+  // enum-keyed catalog entry; UID-only entries (no enum) fall back to tier.
+  const allowed = [];
+  for (const [key, info] of Object.entries(MODELS)) {
+    if (blocked.has(key)) continue;
+    if (info.enumValue && info.enumValue > 0) {
+      const cap = account.capabilities[key];
+      if (cap?.reason === 'user_status' && cap.ok === true) allowed.push(key);
+    } else if (tierModels.includes(key)) {
+      allowed.push(key);
+    }
+  }
+  return allowed;
 }
 
 /**
@@ -397,13 +512,15 @@ export function getApiKey(excludeKeys = [], modelKey = null) {
   });
 
   const { account } = candidates[0];
-  account._rpmHistory.push(now);
+  const reservationTimestamp = nextReservationToken(now);
+  account._rpmHistory.push(reservationTimestamp);
   account.lastUsed = now;
   account._inflight = (account._inflight || 0) + 1;
   return {
     id: account.id, email: account.email, apiKey: account.apiKey,
     apiServerUrl: account.apiServerUrl || '',
     proxy: getEffectiveProxy(account.id) || null,
+    reservationTimestamp,
   };
 }
 
@@ -438,13 +555,15 @@ export function acquireAccountByKey(apiKey, modelKey = null) {
   const used = pruneRpmHistory(a, now);
   if (used >= limit) return null;
   if (modelKey && !isModelAllowedForAccount(a, modelKey)) return null;
-  a._rpmHistory.push(now);
+  const reservationTimestamp = nextReservationToken(now);
+  a._rpmHistory.push(reservationTimestamp);
   a.lastUsed = now;
   a._inflight = (a._inflight || 0) + 1;
   return {
     id: a.id, email: a.email, apiKey: a.apiKey,
     apiServerUrl: a.apiServerUrl || '',
     proxy: getEffectiveProxy(a.id) || null,
+    reservationTimestamp,
   };
 }
 
@@ -530,15 +649,28 @@ export async function ensureLsForAccount(accountId) {
 export function markRateLimited(apiKey, durationMs = 5 * 60 * 1000, modelKey = null) {
   const account = accounts.find(a => a.apiKey === apiKey);
   if (!account) return;
-  const until = Date.now() + durationMs;
+  const safeMs = Math.max(1000, Number(durationMs) || 0);
+  const until = Date.now() + safeMs;
   if (modelKey) {
     if (!account._modelRateLimits) account._modelRateLimits = {};
-    account._modelRateLimits[modelKey] = until;
-    log.warn(`Account ${account.id} (${account.email}) rate-limited on ${modelKey} for ${Math.round(durationMs / 60000)} min`);
+    account._modelRateLimits[modelKey] = Math.max(account._modelRateLimits[modelKey] || 0, until);
+    log.warn(`Account ${account.id} (${account.email}) rate-limited on ${modelKey} for ${Math.round(safeMs / 60000)} min`);
   } else {
-    account.rateLimitedUntil = until;
-    log.warn(`Account ${account.id} (${account.email}) rate-limited (all models) for ${Math.round(durationMs / 60000)} min`);
+    account.rateLimitedUntil = Math.max(account.rateLimitedUntil || 0, until);
+    log.warn(`Account ${account.id} (${account.email}) rate-limited (all models) for ${Math.round(safeMs / 60000)} min`);
   }
+}
+
+export function refundReservation(apiKey, timestamp) {
+  const account = accounts.find(a => a.apiKey === apiKey);
+  if (!account) return false;
+  if (!Number.isFinite(timestamp)) return false;
+  if ((account._inflight || 0) <= 0) return false;
+  pruneRpmHistory(account, Date.now());
+  const idx = account._rpmHistory?.lastIndexOf(timestamp) ?? -1;
+  if (idx === -1) return false;
+  account._rpmHistory.splice(idx, 1);
+  return true;
 }
 
 /**
@@ -626,6 +758,53 @@ export function isAllRateLimited(modelKey) {
   if (!anyEligible) return { allLimited: false };
   const retryAfterMs = soonestExpiry === Infinity ? 60000 : Math.max(1000, soonestExpiry - now);
   return { allLimited: true, retryAfterMs };
+}
+
+export function isAllTemporarilyUnavailable(modelKey) {
+  const now = Date.now();
+  let anyEligible = false;
+  let soonestExpiry = Infinity;
+
+  for (const a of accounts) {
+    if (a.status !== 'active') continue;
+    const limit = rpmLimitFor(a);
+    if (limit <= 0) continue;
+    if (modelKey && !isModelAllowedForAccount(a, modelKey)) continue;
+    anyEligible = true;
+
+    if (a.rateLimitedUntil && a.rateLimitedUntil > now) {
+      soonestExpiry = Math.min(soonestExpiry, a.rateLimitedUntil);
+      continue;
+    }
+
+    if (modelKey && a._modelRateLimits) {
+      const until = a._modelRateLimits[modelKey];
+      if (until && until > now) {
+        soonestExpiry = Math.min(soonestExpiry, until);
+        continue;
+      }
+      if (until && until <= now) delete a._modelRateLimits[modelKey];
+    }
+
+    const used = pruneRpmHistory(a, now);
+    if (used >= limit) {
+      const oldest = a._rpmHistory?.[0];
+      // RPM window has a precise expiry — use it directly. The 30s floor
+      // only applies when no precise expiry exists (strict-reuse busy
+      // without per-account rate-limit data).
+      soonestExpiry = Math.min(
+        soonestExpiry,
+        oldest ? oldest + RPM_WINDOW_MS : now + 30_000
+      );
+      continue;
+    }
+
+    return { allUnavailable: false, retryAfterMs: null };
+  }
+
+  if (!anyEligible) return { allUnavailable: false, retryAfterMs: null };
+  const retryAfterMs = soonestExpiry === Infinity ? 30_000 : Math.max(1000, soonestExpiry - now);
+  return { allUnavailable: true, retryAfterMs };
 }
 
 export function isAuthenticated() {
@@ -862,7 +1041,15 @@ const PROBE_CANARIES = [
  *      4.6 series etc.) which don't appear in the enum allowlist, and serves
  *      as a fallback if GetUserStatus fails on this LS/account combo.
  */
+let _probeInFlight = false;
+
 export async function probeAccount(id) {
+  if (_probeInFlight) {
+    log.info(`Probe skipped for ${id}: another probe is already running`);
+    return null;
+  }
+  _probeInFlight = true;
+  try {
   const account = accounts.find(a => a.id === id);
   if (!account) return null;
 
@@ -978,6 +1165,9 @@ export async function probeAccount(id) {
   saveAccounts();
   log.info(`Probe complete for ${account.id}: tier=${account.tier}${status ? ` plan="${status.planName}"` : ''}`);
   return { tier: account.tier, capabilities: account.capabilities };
+  } finally {
+    _probeInFlight = false;
+  }
 }
 
 export function getAccountCount() {
@@ -993,6 +1183,32 @@ export function getAccountCount() {
 export function validateApiKey(key) {
   if (!config.apiKey) return true;
   return key === config.apiKey;
+}
+
+export function shouldEmitNoAuthWarning(bindHost, hasKey) {
+  if (hasKey) return false;
+  const host = String(bindHost || '').trim().toLowerCase();
+  if (!host || host === '0.0.0.0' || host === '::') return true;
+  return !(host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]');
+}
+
+export function emitNoAuthWarnings(bindHost = '0.0.0.0') {
+  const apiOpen = shouldEmitNoAuthWarning(bindHost, !!config.apiKey);
+  const dashboardOpen = shouldEmitNoAuthWarning(bindHost, !!(config.dashboardPassword || config.apiKey));
+  if (!apiOpen && !dashboardOpen) return;
+  const lines = [
+    '+------------------------------------------------------------------+',
+    '| WARNING: AUTHENTICATION IS NOT CONFIGURED                        |',
+    '| 警告：当前服务未配置访问认证                                      |',
+    '|                                                                  |',
+    '| This server is listening beyond localhost. Set API_KEY before     |',
+    '| exposing REST APIs, and set DASHBOARD_PASSWORD for dashboard      |',
+    '| write operations.                                                |',
+    '| 服务正在非本机地址监听。公网/内网暴露前请配置 API_KEY，并为        |',
+    '| Dashboard 写接口配置 DASHBOARD_PASSWORD。                         |',
+    '+------------------------------------------------------------------+',
+  ];
+  for (const line of lines) log.warn(line);
 }
 
 // ─── Firebase token refresh ──────────────────────────────────

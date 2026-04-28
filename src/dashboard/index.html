@@ -1392,26 +1392,45 @@ tbody tr:hover td { background: var(--surface-2); }
   .sidebar nav a { justify-content: center; padding: 10px; }
   .main { margin-left: 60px; padding: 20px 16px; }
 }
-.contributor-list { display: flex; flex-direction: column; gap: 12px; }
-.contributor-card { display: flex; gap: 16px; padding: 16px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); transition: border-color .15s; }
+.contributor-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); gap: 12px; }
+.contributor-card { display: flex; gap: 14px; padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); transition: border-color .15s; min-width: 0; }
 .contributor-card:hover { border-color: var(--accent); }
-.contributor-card .avatar { width: 64px; height: 64px; border-radius: 50%; flex: none; border: 2px solid var(--border); background: var(--surface-2); object-fit: cover; }
+.contributor-card .avatar { width: 48px; height: 48px; border-radius: 50%; flex: none; border: 2px solid var(--border); background: var(--surface-2); object-fit: cover; }
 .contributor-card .meta { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 0; }
-.contributor-card .meta-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.contributor-card .meta-top { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: start; }
+.contributor-card .identity { display: flex; align-items: center; gap: 8px; min-width: 0; flex-wrap: wrap; }
+.contributor-card .links { display: flex; align-items: center; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }
 .contributor-card .meta-top .name { color: var(--accent); font-weight: 600; font-size: 15px; text-decoration: none; }
 .contributor-card .meta-top .name:hover { text-decoration: underline; }
 .contributor-card .meta-top .pr-link { font-size: 12px; color: var(--text-dim); text-decoration: none; padding: 2px 8px; border: 1px solid var(--border); border-radius: 4px; }
 .contributor-card .meta-top .pr-link:hover { color: var(--accent); border-color: var(--accent); }
 .contributor-card .meta-top .merged-at { font-size: 11px; color: var(--text-dim); }
-.contributor-card .pr-title { font-weight: 500; margin-top: 4px; font-size: 13px; }
+.contributor-card .pr-title { font-weight: 500; margin-top: 2px; font-size: 13px; line-height: 1.45; }
+.contributor-card .summary-toggle { margin-top: 6px; font-size: 12px; color: var(--text-dim); }
+.contributor-card .summary-toggle summary { cursor: pointer; width: fit-content; user-select: none; }
+.contributor-card .summary-toggle summary:hover { color: var(--accent); }
 .contributor-card .summary { font-size: 13px; color: var(--text-muted); line-height: 1.65; margin-top: 6px; }
-.contributor-card .weight-badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; letter-spacing: 0.6px; font-family: var(--font-mono, ui-monospace, monospace); line-height: 1.5; }
-.contributor-card .weight-S-plus { background: linear-gradient(135deg, #f3c677, #d97706); color: #3a2806; box-shadow: 0 0 0 1px rgba(217,119,6,0.25); }
-.contributor-card .weight-S      { background: #c2410c; color: #fff7ed; }
-.contributor-card .weight-A-plus { background: #d97706; color: #fffbeb; }
-.contributor-card .weight-A      { background: var(--surface-2); color: var(--text-muted); border: 1px solid var(--border); }
-.contributor-card .weight-B-plus { background: transparent; color: var(--text-muted); border: 1px dashed var(--border); }
-.contributor-card .weight-B      { background: transparent; color: var(--text-dim); border: 1px solid var(--border); }
+.contributor-card .rarity-badge { display: inline-flex; align-items: center; justify-content: center; min-width: 38px; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 800; letter-spacing: 0.7px; font-family: var(--font-mono, ui-monospace, monospace); line-height: 1.5; }
+.contributor-card .rarity-UR { background: linear-gradient(135deg, #f5d06f, #e11d48 52%, #7c3aed); color: #fff; box-shadow: 0 0 0 1px rgba(225,29,72,0.28); }
+.contributor-card .rarity-SSR { background: linear-gradient(135deg, #f59e0b, #b45309); color: #fff7ed; box-shadow: 0 0 0 1px rgba(180,83,9,0.25); }
+.contributor-card .rarity-SR { background: var(--info-soft); color: var(--info); border: 1px solid rgba(59,130,246,0.28); }
+.contributor-card .contribution-count { font-size: 11px; color: var(--text-dim); padding: 2px 8px; border: 1px solid var(--border); border-radius: 4px; line-height: 1.5; }
+.contributor-card .history-list { list-style: none; padding: 0; margin: 6px 0 0; display: flex; flex-direction: column; gap: 8px; }
+.contributor-card .history-item { padding: 10px 12px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-2); }
+.contributor-card .history-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.contributor-card .history-head .pr-link { font-size: 12px; color: var(--text-dim); text-decoration: none; padding: 2px 8px; border: 1px solid var(--border); border-radius: 4px; }
+.contributor-card .history-head .pr-link:hover { color: var(--accent); border-color: var(--accent); }
+.contributor-card .history-head .merged-at { font-size: 11px; color: var(--text-dim); }
+.contributor-card .history-rarity-label { font-size: 11px; color: var(--text-dim); font-style: italic; flex: 1; min-width: 0; }
+.contributor-card .history-title { font-size: 13px; font-weight: 500; margin-top: 6px; line-height: 1.45; }
+.contributor-card .history-summary { font-size: 12px; color: var(--text-muted); line-height: 1.65; margin-top: 6px; }
+@media (max-width: 640px) {
+  .contributor-list { grid-template-columns: 1fr; }
+  .contributor-card { padding: 12px; gap: 12px; }
+  .contributor-card .avatar { width: 40px; height: 40px; }
+  .contributor-card .meta-top { grid-template-columns: 1fr; }
+  .contributor-card .links { justify-content: flex-start; }
+}
 </style>
 <script type="module">
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/11.6.0/firebase-app.js';
@@ -2143,6 +2162,23 @@ window._firebaseOAuth = async function(provider) {
       </div>
       <div class="section-body" id="system-prompts-editor" style="display:grid;gap:14px"></div>
     </div>
+    <div class="section" style="margin-top:24px">
+      <div class="section-header">
+        <div>
+          <div class="section-title" data-i18n="section.skin.title">界面风格</div>
+          <div class="section-desc" data-i18n="section.skin.desc">控制台外观。默认现代风；手绘草稿风是实验性 UI，部分功能简化或采用不同布局。切换后页面会刷新。</div>
+        </div>
+      </div>
+      <div class="section-body">
+        <div style="display:flex;align-items:center;gap:16px;padding:12px;background:var(--surface-2);border-radius:var(--radius)">
+          <select id="skin-select" class="input" style="max-width:240px" onchange="App.switchSkin(this.value)">
+            <option value="modern" data-i18n="skin.modern">默认现代风</option>
+            <option value="sketch" data-i18n="skin.sketch">手绘草稿风（实验）</option>
+          </select>
+          <div class="text-sm text-muted" data-i18n="skin.hint">选择后立即写入 cookie 并刷新</div>
+        </div>
+      </div>
+    </div>
   </section>
 </main>
 
@@ -2734,7 +2770,7 @@ const App = {
           <table style="background:transparent">
             <tr><td style="color:var(--text-muted);width:120px">${I18n.t('loginResult.fields.email')}</td><td>${this.esc(r.email)}</td></tr>
             <tr><td style="color:var(--text-muted)">${I18n.t('loginResult.fields.name')}</td><td>${this.esc(r.name || '-')}</td></tr>
-            <tr><td style="color:var(--text-muted)">${I18n.t('loginResult.fields.apiKey')}</td><td><code class="break-all">${this.esc(r.apiKey)}</code></td></tr>
+            <tr><td style="color:var(--text-muted)">${I18n.t('loginResult.fields.apiKey')}</td><td><code class="break-all">${this.esc(r.apiKey_masked || r.apiKey || '')}</code></td></tr>
             ${r.account ? `<tr><td style="color:var(--text-muted)">${I18n.t('loginResult.fields.accountId')}</td><td><code>${r.account.id}</code> <span class="badge active">${r.account.status}</span></td></tr>` : ''}
           </table>
         </div>`);
@@ -2769,7 +2805,7 @@ const App = {
                   <td>${this.esc(r.email || '-')}</td>
                   <td><span class="badge ${r.success ? 'active' : 'error'}">${r.success ? I18n.t('batch.success') : I18n.t('batch.fail')}</span></td>
                   <td class="text-sm">${r.success
-                    ? `<span class="break-all"><code>${this.esc(r.apiKey ? r.apiKey.slice(0, 16) + '...' : '-')}</code>${r.account ? ` · ${I18n.t('table.header.account')} ${this.esc(r.account.id)}` : ''}</span>`
+                    ? `<span class="break-all"><code>${this.esc(r.apiKey_masked || (r.apiKey ? r.apiKey.slice(0, 16) + '...' : '-'))}</code>${r.account ? ` · ${I18n.t('table.header.account')} ${this.esc(r.account.id)}` : ''}</span>`
                     : `<span style="color:var(--error)">${this.esc(r.error || I18n.t('error.unknown'))}</span>`}</td>
                 </tr>
               `).join('')}
@@ -2835,7 +2871,7 @@ const App = {
       const r = await this.api('POST', '/windsurf-login', { email, password, proxy, autoAdd });
       if (r.success) {
         entry.status = 'success';
-        entry.apiKey = r.apiKey?.slice(0, 16) + '...';
+        entry.apiKey = r.apiKey_masked || (r.apiKey?.slice(0, 16) + '...');
         this.renderSingleWindsurfLoginResult(r, autoAdd);
         this.toast(autoAdd ? I18n.t('toast.loginSuccessAdded') : I18n.t('toast.loginSuccess'), 'success');
         this.loadAccounts();
@@ -2888,7 +2924,7 @@ const App = {
           email: item.email,
           proxy: this.getWindsurfProxyLabel(proxy),
           status: item.success ? 'success' : `error: ${item.error || 'unknown'}`,
-          apiKey: item.success && item.apiKey ? item.apiKey.slice(0, 16) + '...' : undefined,
+          apiKey: item.success ? (item.apiKey_masked || (item.apiKey ? item.apiKey.slice(0, 16) + '...' : undefined)) : undefined,
         })));
       this.toast(I18n.t('batch.importComplete', {success: r.successCount || 0, fail: r.failCount || 0}), (r.failCount || 0) ? 'info' : 'success');
       if ((r.successCount || 0) > 0) {
@@ -3706,8 +3742,8 @@ const App = {
   //
   // Uses fetch + ReadableStream instead of EventSource so the dashboard
   // password rides in an X-Dashboard-Password header rather than a ?pwd=
-  // query string (URL-logged in proxies, browser history). checkAuth()
-  // in dashboard/api.js still accepts ?pwd= as a fallback.
+  // query string (URL-logged in proxies, browser history). The query
+  // fallback in dashboard/api.js was removed once all callers migrated.
   loadLogs() {
     if (this.sseConn) { try { this.sseConn.close(); } catch {} this.sseConn = null; }
     this.logEntries = [];
@@ -4524,6 +4560,13 @@ const App = {
     const d = await this.api('GET', '/experimental');
     const cb = document.getElementById('exp-cascade-reuse');
     if (cb) cb.checked = !!d.flags?.cascadeConversationReuse;
+    // Reflect current skin cookie in the dropdown so reload state is visible.
+    const skinSel = document.getElementById('skin-select');
+    if (skinSel) {
+      const m = document.cookie.match(/(?:^|;\s*)dashboard_skin=([^;]+)/);
+      const cur = m ? decodeURIComponent(m[1]) : 'modern';
+      skinSel.value = (cur === 'sketch') ? 'sketch' : 'modern';
+    }
     const pool = d.conversationPool || {};
     document.getElementById('exp-pool-cards').innerHTML = `
       <div class="card info">
@@ -4630,6 +4673,15 @@ const App = {
     this.loadExperimental();
   },
 
+  // ─── Console skin (default ↔ experimental sketch UI) ────────
+  switchSkin(skin) {
+    const next = skin === 'sketch' ? 'sketch' : 'modern';
+    // Year-long cookie, lax samesite. path=/ so /dashboard sees it.
+    const oneYear = 365 * 24 * 3600;
+    document.cookie = `dashboard_skin=${next}; path=/; max-age=${oneYear}; samesite=lax`;
+    location.reload();
+  },
+
   // ─── Ban Detection ───────────────────────────
   async loadBans() {
     const d = await this.api('GET', '/accounts');
@@ -4703,108 +4755,98 @@ const App = {
       fallback();
     }
   },
-  // Hand-maintained roster of external contributors. Update here when a
-  // new PR lands; the dashboard Credits panel renders straight from this.
-  CONTRIBUTORS: [
-    {
-      login: 'aict666',
-      pr: 51,
-      weight: 'S+',
-      weightLabel: '最高信任级别：root-cause 精准、测试齐全、诊断可追溯',
-      mergedAt: '2026-04-24',
-      title: 'fix: 重写 tool preamble 去 jailbreak 措辞，绕过 Opus 4.7 injection guard',
-      summary: 'Opus-class 模型走 /v1/messages 时完全不 emit <tool_call>，直接回复"The pasted content appears to be a prompt-injection attempt"。root cause 精确到 TOOL_PROTOCOL_HEADER 里三段越狱措辞（IGNORE any earlier / For THIS request only / [Tool-calling context] 栅栏）被 Opus 自己的 injection detector 反杀。重写成中性的 "The following functions are available for this turn"，保留 <tool_call> 协议合同与 parser 不动，附带 3 条 banned-regex 回归测试防止未来倒退。PR body 可以直接发 Anthropic 论坛。',
-    },
-    {
-      login: 'baily-zhang',
-      pr: 45,
-      weight: 'S',
-      weightLabel: '根因修复：上下文重放 / usage 累加',
-      mergedAt: '2026-04-24',
-      title: 'fix: 切断 Cascade 复用时的旧 step 重放（alpha→alphabeta→alphabeta…）',
-      summary: '复用 cascade_id 时 GetCascadeTrajectorySteps 每次都从 step 0 拉，结果旧 step 的 assistant text 被重放到新轮里，输出变成 "alpha" → "alphabeta" → "alphabetabeta"；usage 也累加成整条 cascade 的总量。修法是把 stepOffset / generatorOffset 随 pool entry 持久化，每次复用时从上次的 offset 继续拉。给 PR #36 之后仍报胡言乱语的用户找回最后一块拼图。',
-    },
-    {
-      login: 'aict666',
-      pr: 44,
-      weight: 'S+',
-      weightLabel: '账号 tier 识别的关键修复',
-      mergedAt: '2026-04-24',
-      title: 'fix(auth): 阻止 non-premium 调用把 Pro/Trial 降级为 free',
-      summary: 'updateCapability 在每次成功 chat 后无条件 inferTier() 覆写 account.tier。inferTier 只认 claude-opus-4.6 / sonnet-4.6 作为 Pro 证据，Pro 账号只要调用 gemini-2.5-flash 或 gpt-4o-mini 一次就被悄悄降级到 free，后续请求按 free 限制，Dashboard 显示 FREE。修法是当 GetUserStatus 已经给过权威 tier（userStatusLastFetched > 0 或 tierManual=true）时跳过 inferTier 回退。probeAccount 原本有手动 restore 工作绕过，chat handler 路径没有，每个真实 API 调用都在偷偷降级账号。',
-    },
-    {
-      login: 'smeinecke',
-      pr: 43,
-      weight: 'A',
-      weightLabel: '国际化基础设施贡献者',
-      mergedAt: '2026-04-24',
-      title: 'feat: Dashboard 完整 i18n 国际化',
-      summary: '14 个 commit 把所有硬编码中文改成 I18n.t() 调用，补齐 en.json / zh-CN.json 缺键，加 check-i18n.js 扫 JavaScript 里的 I18n.t() key 确保 locale 里都有对应翻译。让 Dashboard 真正能中英双语切换，不是翻了一半的半成品。',
-    },
-    {
-      login: 'baily-zhang',
-      pr: 36,
-      weight: 'S',
-      weightLabel: '上下文丢失根因修复者',
-      mergedAt: '2026-04-22',
-      title: 'fix: fingerprint 只 hash 稳定轮，消除 0% 复用命中',
-      summary: 'Claude Code 每次重构 assistant content（数组 ↔ 字符串 ↔ 含 tool_use blocks）而 system prompt 又含动态项目状态，老 fingerprint 把这两者 hash 进去导致永不匹配。改成只 hash user + tool_result 两类稳定轮，system prompt 通过 CASCADE_REUSE_HASH_SYSTEM=1 opt-in。外加可配置历史 budget（1m 模型更大默认）+ LS_DATA_DIR override。#24 "胡言乱语"爆发后的第一块拼图，和 PR #45 合起来算这条线上最彻底的修复。',
-    },
-    {
-      login: 'youfak',
-      pr: 26,
-      weight: 'A+',
-      weightLabel: '部署体验贡献者：Docker 零依赖适配',
-      mergedAt: '2026-04-22',
-      title: 'feat: Docker 全套部署 + DATA_DIR + LS 重启兜底',
-      summary: 'Dockerfile / docker-compose.yml / .dockerignore / .gitattributes 一整套，配 DATA_DIR 配置项把 accounts.json / stats.json / logs/ 等持久化文件统一收敛到可挂载的数据目录。附带修两个 LS 稳定性问题：Windows 宿主机构建时 install-ls.sh 的 CRLF 会导致容器内 set: pipefail 报错；Dashboard 点重启 LS 时若启动失败会把整个 Node 进程打崩。',
-    },
-    {
-      login: 'motto1',
-      pr: 20,
-      weight: 'A',
-      weightLabel: '登录取号链路还原',
-      mergedAt: '2026-04-21',
-      title: 'fix(dashboard): 补上 Windsurf 官网实际使用的 Auth1 登录链路',
-      summary: '官网可以登但 Dashboard 登录失败 —— 原因是旧 Firebase 路径已不是主链路。逆向补出 /_devin-auth/connections → /_devin-auth/password/login → WindsurfPostAuth → GetOneTimeAuthToken 四步流程，保留旧 Firebase 作为兜底，再顺手加了邮箱/密码批量导入 + 剪贴板读取。',
-    },
-    {
-      login: 'dd373156',
-      pr: 1,
-      weight: 'B+',
-      weightLabel: '首位外部 PR 贡献者',
-      mergedAt: '2026-04-20',
-      title: 'fix(models): 让 pro tier 识别到云端动态合并的模型',
-      summary: 'MODEL_TIER_ACCESS.pro 引用的是 ALL_MODEL_KEYS —— 模块加载时的 Object.keys(MODELS) 快照。mergeCloudModels 启动后加进来的五个 claude-opus-4-7-* 永远不在这个冻结数组里，每个请求都 403 model_not_entitled。一行改成 getter 让每次访问都重新枚举 live MODELS dict。三步 curl 复现写得教科书级。',
-    },
-    {
-      login: 'colin1112a',
-      pr: 13,
-      weight: 'B+',
-      weightLabel: '早期代码审查先行者（PR 未合但方向正确）',
-      mergedAt: '2026-04-21',
-      title: 'fix: 一次性审计并提交 15 个安全 / 并发 / 资源管理 bug',
-      summary: '系统性扫了一遍仓库提了 CRITICAL/HIGH/MEDIUM 15 条修复建议：XSS 转义、shell 注入防护、10MB body 上限、auth 路由顺序、gRPC 双回调保护、LS pool 并发竞态、HTTP/2 frame 16MB 上限、varint BigInt 支持。PR 因改动面过大未直接合并，但其中多项被后续独立重做。',
-    },
-  ],
-  loadCredits() {
+  // Roster lives in /dashboard/data/contributors.json so default UI
+  // and sketch UI share one source of truth. Fetched at panel-open.
+  CONTRIBUTORS_CACHE: null,
+  async fetchContributors() {
+    if (this.CONTRIBUTORS_CACHE) return this.CONTRIBUTORS_CACHE;
+    try {
+      const res = await fetch('/dashboard/data/contributors.json');
+      if (!res.ok) throw new Error(`status ${res.status}`);
+      const data = await res.json();
+      this.CONTRIBUTORS_CACHE = Array.isArray(data?.contributors) ? data.contributors : [];
+    } catch (e) {
+      console.error('fetchContributors failed:', e);
+      this.CONTRIBUTORS_CACHE = [];
+    }
+    return this.CONTRIBUTORS_CACHE;
+  },
+  contributorRarity(weight) {
+    if (weight === 'S+') return 'UR';
+    if (weight === 'S' || weight === 'A+') return 'SSR';
+    return 'SR';
+  },
+  weightRank(w) {
+    return ({ 'S+': 6, 'S': 5, 'A+': 4, 'A': 3, 'B+': 2, 'B': 1 })[w] || 0;
+  },
+  groupContributors(list) {
+    const map = new Map();
+    for (const c of list) {
+      if (!map.has(c.login)) map.set(c.login, { login: c.login, prs: [] });
+      map.get(c.login).prs.push(c);
+    }
+    const groups = [];
+    for (const g of map.values()) {
+      g.prs.sort((a, b) => (b.mergedAt || '').localeCompare(a.mergedAt || ''));
+      g.latest = g.prs[0];
+      g.topWeight = g.prs.reduce((best, p) => this.weightRank(p.weight) > this.weightRank(best) ? p.weight : best, '');
+      groups.push(g);
+    }
+    groups.sort((a, b) =>
+      this.weightRank(b.topWeight) - this.weightRank(a.topWeight)
+      || (b.latest.mergedAt || '').localeCompare(a.latest.mergedAt || '')
+    );
+    return groups;
+  },
+  async loadCredits() {
     const body = document.getElementById('credits-body');
     if (!body) return;
-    body.innerHTML = `<div class="contributor-list">${this.CONTRIBUTORS.map(c => `
-      <div class="contributor-card">
-        <img class="avatar" src="https://github.com/${this.esc(c.login)}.png?size=128" alt="${this.esc(c.login)}" loading="lazy" onerror="this.style.visibility='hidden'">
-        <div class="meta">
-          <div class="meta-top">
-            <a class="name" target="_blank" rel="noopener" href="https://github.com/${this.esc(c.login)}">@${this.esc(c.login)}</a>
-            ${c.weight ? `<span class="weight-badge weight-${this.esc(c.weight).replace('+','-plus')}" title="${this.esc(c.weightLabel || '')}">${this.esc(c.weight)}</span>` : ''}
-            <a class="pr-link" target="_blank" rel="noopener" href="https://github.com/dwgx/WindsurfAPI/pull/${c.pr}">PR #${c.pr}</a>
-            <span class="merged-at">${this.esc(c.mergedAt)}</span>
+    const list = await this.fetchContributors();
+    const groups = this.groupContributors(list);
+    body.innerHTML = `<div class="contributor-list">${groups.map(g => {
+      const latest = g.latest;
+      const count = g.prs.length;
+      const rarity = this.contributorRarity(g.topWeight);
+      const summaryText = count > 1
+        ? I18n.t('credits.history', { count })
+        : I18n.t('credits.contributionDetails');
+      const items = g.prs.map(p => {
+        const r = this.contributorRarity(p.weight);
+        return `
+          <li class="history-item">
+            <div class="history-head">
+              <a class="pr-link" target="_blank" rel="noopener" href="https://github.com/dwgx/WindsurfAPI/pull/${p.pr}">PR #${p.pr}</a>
+              <span class="merged-at">${this.esc(p.mergedAt || '')}</span>
+              ${p.weight ? `<span class="rarity-badge rarity-${this.esc(r)}" title="${this.esc(p.weightLabel || '')}">${this.esc(r)}</span>` : ''}
+              ${p.weightLabel ? `<span class="history-rarity-label">${this.esc(p.weightLabel)}</span>` : ''}
+            </div>
+            <div class="history-title">${this.esc(p.title)}</div>
+            <div class="history-summary">${this.esc(p.summary)}</div>
+          </li>`;
+      }).join('');
+      return `
+        <div class="contributor-card">
+          <img class="avatar" src="https://github.com/${this.esc(g.login)}.png?size=128" alt="${this.esc(g.login)}" loading="lazy" onerror="this.style.visibility='hidden'">
+          <div class="meta">
+            <div class="meta-top">
+              <div class="identity">
+                <a class="name" target="_blank" rel="noopener" href="https://github.com/${this.esc(g.login)}">@${this.esc(g.login)}</a>
+                ${g.topWeight ? `<span class="rarity-badge rarity-${this.esc(rarity)}" title="${this.esc(latest.weightLabel || '')}">${this.esc(rarity)}</span>` : ''}
+                <span class="contribution-count">×${count}</span>
+              </div>
+              <div class="links">
+                <a class="pr-link" target="_blank" rel="noopener" href="https://github.com/dwgx/WindsurfAPI/pull/${latest.pr}">PR #${latest.pr}</a>
+                <span class="merged-at">${this.esc(latest.mergedAt || '')}</span>
+              </div>
+            </div>
+            <div class="pr-title">${this.esc(latest.title)}</div>
+            <details class="summary-toggle">
+              <summary>${this.esc(summaryText)}</summary>
+              <ol class="history-list">${items}</ol>
+            </details>
           </div>
-          <div class="pr-title">${this.esc(c.title)}</div>
-          <div class="summary">${this.esc(c.summary)}</div>
-        </div>
-      </div>`).join('')}</div>`;
+        </div>`;
+    }).join('')}</div>`;
   },
   esc(s) { return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); },
   // For values interpolated into an inline `onclick="App.f('${...}')"`
